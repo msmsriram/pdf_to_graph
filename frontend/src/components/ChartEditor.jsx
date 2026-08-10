@@ -1,0 +1,631 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import ReactECharts from "echarts-for-react";
+import * as echarts from "echarts";
+import { api, assetUrl } from "../lib/api.js";
+import { useStore } from "../store.js";
+import { specToOption } from "../lib/chartOption.js";
+import { useDraggablePoints } from "../lib/useChartInteractions.js";
+
+const clone = (o) => JSON.parse(JSON.stringify(o));
+const PALETTE = ["#5b8cff", "#7c5cff", "#34d399", "#fbbf24", "#f87171", "#22d3ee", "#f472b6", "#a3e635"];
+
+const TABS = ["Data", "Style", "Axes", "Series", "Labels", "Source", "History"];
+
+export default function ChartEditor({ docId, chart }) {
+  const updateChart = useStore((s) => s.updateChart);
+  const theme = useStore((s) => s.theme);
+  const [tab, setTab] = useState("Data");
+  const chartRef = useRef(null);
+
+  const currentSpec = chart.versions[chart.current_version].spec;
+  const originalSpec = chart.versions[0].spec;
+
+  // Working draft (uncommitted edits).
+  const [draft, setDraft] = useState(() => clone(currentSpec));
+  const [dirty, setDirty] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [interactive, setInteractive] = useState(false);
+  const [activeSeries, setActiveSeries] = useState(0);
+  const [showGrid, setShowGrid] = useState(true);
+
+  // Reset draft whenever the selected chart or its current version changes.
+  useEffect(() => {
+    setDraft(clone(chart.versions[chart.current_version].spec));
+    setDirty(false);
+    setActiveSeries(0);
+  }, [chart.chart_id, chart.current_version]);
+
+  const option = useMemo(() => specToOption(draft, { theme, showGrid }), [draft, theme, showGrid]);
+
+  const mutate = (fn) => {
+    setDraft((d) => {
+      const next = clone(d);
+      fn(next);
+      return next;
+    });
+    setDirty(true);
+  };
+
+  // Stable callbacks for direct mouse manipulation (drag a point / add a point).
+  const commitPoint = useCallback((si, pi, patch) => {
+    setDraft((d) => {
+      const next = clone(d);
+      if (next.series[si]?.points[pi]) Object.assign(next.series[si].points[pi], patch);
+      return next;
+    });
+    setDirty(true);
+  }, []);
+
+  const addPointToSeries = useCallback((si, point) => {
+    setDraft((d) => {
+      const next = clone(d);
+      if (!next.series[si]) return d;
+      next.series[si].points.push(point);
+      return next;
+    });
+    setDirty(true);
+  }, []);
+
+  const addSeries = () =>
+    mutate((d) => d.series.push({ name: `Line ${d.series.length + 1}`, color: null, conditions: null, points: [] }));
+
+  useDraggablePoints({
+    chartRef,
+    draft,
+    theme,
+    enabled: interactive,
+    activeSeries,
+    onCommitPoint: commitPoint,
+    onAddPoint: addPointToSeries,
+  });
+
+  const saveVersion = async () => {
+    setBusy(true);
+    try {
+      const updated = await api.saveVersion(docId, chart.chart_id, draft, null);
+      updateChart(updated);
+      setDirty(false);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const revert = async () => {
+    setBusy(true);
+    try {
+      const updated = await api.revert(docId, chart.chart_id);
+      updateChart(updated);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const jumpToVersion = async (v) => {
+    setBusy(true);
+    try {
+      const updated = await api.setVersion(docId, chart.chart_id, v);
+      updateChart(updated);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const finalize = async () => {
+    setBusy(true);
+    try {
+      const updated = await api.finalize(docId, chart.chart_id);
+      updateChart(updated);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resetDraft = () => {
+    setDraft(clone(currentSpec));
+    setDirty(false);
+  };
+
+  // ---- export ----
+  // Render through a dedicated offscreen instance using the print-friendly style
+  // (white background + visible gridlines) so every export matches the source
+  // chart's gridlines, regardless of the on-screen light/dark theme.
+  const renderOffscreen = (renderer) => {
+    const div = document.createElement("div");
+    div.style.cssText = "width:960px;height:600px;position:absolute;left:-99999px;top:0;";
+    document.body.appendChild(div);
+    const inst = echarts.init(div, null, { renderer });
+    inst.setOption({ ...specToOption(draft, { theme, forExport: true, showGrid }), animation: false });
+    return { inst, cleanup: () => { inst.dispose(); div.remove(); } };
+  };
+  const exportImage = (type) => {
+    const { inst, cleanup } = renderOffscreen("canvas");
+    const url = inst.getDataURL({ type: type === "jpeg" ? "jpeg" : "png", pixelRatio: 2, backgroundColor: "#ffffff" });
+    cleanup();
+    downloadURL(url, `${draft.title || chart.chart_id}.${type}`);
+  };
+  const exportSVG = () => {
+    const { inst, cleanup } = renderOffscreen("svg");
+    let svg = null;
+    try {
+      svg = inst.renderToSVGString ? inst.renderToSVGString() : null;
+    } catch (_) {}
+    cleanup();
+    if (svg) downloadURL("data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg), `${draft.title || chart.chart_id}.svg`);
+    else exportImage("png");
+  };
+  const exportData = (fmt) => {
+    if (fmt === "json") {
+      downloadURL("data:application/json," + encodeURIComponent(JSON.stringify(draft, null, 2)), `${chart.chart_id}.json`);
+    } else {
+      // CSV: series as columns
+      const rows = [];
+      const header = ["x/label", ...draft.series.map((s) => s.name)];
+      const maxLen = Math.max(...draft.series.map((s) => s.points.length), 0);
+      for (let i = 0; i < maxLen; i++) {
+        const first = draft.series[0]?.points[i];
+        const key = first?.label ?? first?.x ?? i;
+        rows.push([key, ...draft.series.map((s) => s.points[i]?.y ?? "")]);
+      }
+      const csv = [header, ...rows].map((r) => r.join(",")).join("\n");
+      downloadURL("data:text/csv;charset=utf-8," + encodeURIComponent(csv), `${chart.chart_id}.csv`);
+    }
+  };
+
+  return (
+    <div className="card editor">
+      {/* ---- main: chart + compare ---- */}
+      <div className="editor-main">
+        <div style={{ display: "flex", alignItems: "center", marginBottom: 12 }}>
+          <div>
+            <div style={{ fontSize: 16, fontWeight: 650 }}>{draft.title || chart.chart_id}</div>
+            <div className="muted">
+              Page {chart.page_number} · v{chart.current_version} of {chart.versions.length - 1}
+              {chart.final_version != null && <span className="chip" style={{ marginLeft: 8 }}>finalized v{chart.final_version}</span>}
+            </div>
+          </div>
+          <div className="spacer" />
+          {dirty && <span className="dirty-badge">● unsaved edits</span>}
+        </div>
+
+        {/* interactive toolbar */}
+        <div className="chart-toolbar">
+          <button
+            className={`btn btn-sm ${interactive ? "btn-primary" : ""}`}
+            onClick={() => setInteractive((v) => !v)}
+            disabled={draft.chart_type === "pie"}
+            title={draft.chart_type === "pie" ? "Drag editing isn't available for pie charts" : "Toggle direct mouse editing"}
+          >
+            {interactive ? "✓ Interactive edit on" : "✋ Interactive edit"}
+          </button>
+          {interactive && draft.chart_type !== "pie" && (
+            <>
+              <span className="muted">drag points · double-click to add</span>
+              {draft.series.length > 1 && (
+                <select
+                  className="input"
+                  style={{ width: "auto" }}
+                  value={activeSeries}
+                  onChange={(e) => setActiveSeries(Number(e.target.value))}
+                >
+                  {draft.series.map((s, i) => (
+                    <option key={i} value={i}>
+                      add to: {s.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </>
+          )}
+          {draft.chart_type === "pie" && <span className="muted">drag editing not available for pie</span>}
+          <div className="spacer" />
+          <button
+            className={`btn btn-sm ${showGrid ? "btn-primary" : ""}`}
+            onClick={() => setShowGrid((v) => !v)}
+            title="Show / hide gridlines (applies on screen and in exports)"
+          >
+            {showGrid ? "▦ Gridlines on" : "▦ Gridlines off"}
+          </button>
+          <button className="btn btn-sm" onClick={addSeries}>+ Add line / series</button>
+        </div>
+
+        <div className="chart-canvas">
+          <ReactECharts ref={chartRef} option={option} style={{ height: 420 }} notMerge lazyUpdate opts={{ renderer: "canvas" }} />
+        </div>
+
+        {/* original vs reconstruction */}
+        <div className="compare">
+          <div className="compare-pane">
+            <div className="cap">Original (from PDF)</div>
+            <img src={assetUrl(docId, chart.crop_image)} alt="original chart" />
+          </div>
+          <div className="compare-pane">
+            <div className="cap">Reconstructed (editable)</div>
+            <div style={{ background: "var(--bg-0)" }}>
+              <ReactECharts option={option} style={{ height: 220 }} notMerge lazyUpdate />
+            </div>
+          </div>
+        </div>
+
+        {/* export */}
+        <div style={{ display: "flex", gap: 8, marginTop: 14, flexWrap: "wrap" }}>
+          <span className="muted" style={{ alignSelf: "center" }}>Export:</span>
+          <button className="btn btn-sm" onClick={() => exportImage("png")}>PNG</button>
+          <button className="btn btn-sm" onClick={() => exportImage("jpeg")}>JPEG</button>
+          <button className="btn btn-sm" onClick={exportSVG}>SVG</button>
+          <button className="btn btn-sm" onClick={() => exportData("csv")}>CSV</button>
+          <button className="btn btn-sm" onClick={() => exportData("json")}>JSON</button>
+        </div>
+      </div>
+
+      {/* ---- side: tabbed editor ---- */}
+      <div className="editor-side">
+        <div className="tabs">
+          {TABS.map((t) => (
+            <div key={t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
+              {t}
+            </div>
+          ))}
+        </div>
+        <div className="tab-body">
+          {tab === "Data" && <DataTab draft={draft} mutate={mutate} addSeries={addSeries} />}
+          {tab === "Style" && <StyleTab draft={draft} mutate={mutate} />}
+          {tab === "Axes" && <AxesTab draft={draft} mutate={mutate} />}
+          {tab === "Series" && <SeriesTab draft={draft} mutate={mutate} />}
+          {tab === "Labels" && <LabelsTab draft={draft} mutate={mutate} />}
+          {tab === "Source" && <SourceTab chart={chart} />}
+          {tab === "History" && (
+            <HistoryTab chart={chart} onJump={jumpToVersion} onFinalize={finalize} busy={busy} />
+          )}
+        </div>
+
+        <div className="editor-actions">
+          <button className="btn btn-primary btn-sm" disabled={!dirty || busy} onClick={saveVersion}>
+            Save as new version
+          </button>
+          <button className="btn btn-sm" disabled={!dirty} onClick={resetDraft}>
+            Discard
+          </button>
+          <button className="btn btn-sm" disabled={chart.current_version === 0 || busy} onClick={revert}>
+            ↶ Revert one
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ tabs */
+function DataTab({ draft, mutate, addSeries }) {
+  return (
+    <>
+      <div className="muted" style={{ marginBottom: 12 }}>
+        Edit any value — the chart updates instantly. Values are gpt-5.6-sol estimates unless printed on the source.
+      </div>
+      {draft.series.map((s, si) => (
+        <div key={si} className="series-block">
+          <div className="series-head">
+            <span style={{ width: 10, height: 10, borderRadius: 3, background: s.color || PALETTE[si % PALETTE.length] }} />
+            <strong style={{ fontSize: 13 }}>{s.name}</strong>
+          </div>
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>{s.points.some((p) => p.label != null) ? "Label" : "X"}</th>
+                <th>Y</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {s.points.map((p, pi) => (
+                <tr key={pi}>
+                  <td>
+                    {p.label != null ? (
+                      <input value={p.label ?? ""} onChange={(e) => mutate((d) => (d.series[si].points[pi].label = e.target.value))} />
+                    ) : (
+                      <input
+                        type="number"
+                        value={p.x ?? ""}
+                        onChange={(e) => mutate((d) => (d.series[si].points[pi].x = numOrNull(e.target.value)))}
+                      />
+                    )}
+                  </td>
+                  <td>
+                    <input
+                      type="number"
+                      value={p.y ?? ""}
+                      onChange={(e) => mutate((d) => (d.series[si].points[pi].y = numOrNull(e.target.value)))}
+                    />
+                  </td>
+                  <td>
+                    <button className="btn btn-ghost btn-sm" onClick={() => mutate((d) => d.series[si].points.splice(pi, 1))}>✕</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <button
+            className="btn btn-sm"
+            style={{ marginTop: 8 }}
+            onClick={() =>
+              mutate((d) => {
+                const last = d.series[si].points[d.series[si].points.length - 1] || {};
+                d.series[si].points.push(last.label != null ? { label: "new", y: 0 } : { x: 0, y: 0 });
+              })
+            }
+          >
+            + Add point
+          </button>
+        </div>
+      ))}
+      <button className="btn btn-sm btn-primary" style={{ width: "100%" }} onClick={addSeries}>
+        + Add new line / series
+      </button>
+    </>
+  );
+}
+
+function StyleTab({ draft, mutate }) {
+  return (
+    <>
+      <div className="field">
+        <label>Chart type</label>
+        <select className="input" value={draft.chart_type} onChange={(e) => mutate((d) => (d.chart_type = e.target.value))}>
+          {["line", "area", "bar", "scatter", "pie"].map((t) => (
+            <option key={t} value={t}>{t}</option>
+          ))}
+        </select>
+      </div>
+      <div className="field inline">
+        <input type="checkbox" checked={draft.stacked} onChange={(e) => mutate((d) => (d.stacked = e.target.checked))} />
+        <label className="mb0" style={{ margin: 0 }}>Stacked (bar)</label>
+      </div>
+      <div className="field inline">
+        <input type="checkbox" checked={draft.legend} onChange={(e) => mutate((d) => (d.legend = e.target.checked))} />
+        <label className="mb0" style={{ margin: 0 }}>Show legend</label>
+      </div>
+      <div className="field">
+        <label>Title</label>
+        <input className="input" value={draft.title ?? ""} onChange={(e) => mutate((d) => (d.title = e.target.value))} />
+      </div>
+      <div className="field">
+        <label>Subtitle</label>
+        <input className="input" value={draft.subtitle ?? ""} onChange={(e) => mutate((d) => (d.subtitle = e.target.value))} />
+      </div>
+      <label>Series colors</label>
+      {draft.series.map((s, si) => (
+        <div key={si} className="inline" style={{ marginBottom: 8 }}>
+          <input
+            type="color"
+            className="color-swatch"
+            value={s.color || PALETTE[si % PALETTE.length]}
+            onChange={(e) => mutate((d) => (d.series[si].color = e.target.value))}
+          />
+          <span style={{ fontSize: 12 }}>{s.name}</span>
+        </div>
+      ))}
+    </>
+  );
+}
+
+function AxisFields({ axis, onChange }) {
+  return (
+    <>
+      <div className="row2">
+        <div className="field">
+          <label>Label</label>
+          <input className="input" value={axis.label ?? ""} onChange={(e) => onChange({ ...axis, label: e.target.value })} />
+        </div>
+        <div className="field">
+          <label>Unit</label>
+          <input className="input" value={axis.unit ?? ""} onChange={(e) => onChange({ ...axis, unit: e.target.value })} />
+        </div>
+      </div>
+      <div className="row2">
+        <div className="field">
+          <label>Scale</label>
+          <select className="input" value={axis.scale} onChange={(e) => onChange({ ...axis, scale: e.target.value })}>
+            <option value="linear">linear</option>
+            <option value="log">log</option>
+          </select>
+        </div>
+        <div className="field">
+          <label>Min / Max</label>
+          <div className="row2">
+            <input className="input" type="number" placeholder="auto" value={axis.min ?? ""} onChange={(e) => onChange({ ...axis, min: numOrNull(e.target.value) })} />
+            <input className="input" type="number" placeholder="auto" value={axis.max ?? ""} onChange={(e) => onChange({ ...axis, max: numOrNull(e.target.value) })} />
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function AxesTab({ draft, mutate }) {
+  return (
+    <>
+      <div className="section-title" style={{ marginTop: 0 }}>X axis</div>
+      <AxisFields axis={draft.x_axis} onChange={(ax) => mutate((d) => (d.x_axis = ax))} />
+      <div className="section-title">Y axis</div>
+      <AxisFields axis={draft.y_axis} onChange={(ax) => mutate((d) => (d.y_axis = ax))} />
+    </>
+  );
+}
+
+function SeriesTab({ draft, mutate }) {
+  return (
+    <>
+      {draft.series.map((s, si) => (
+        <div key={si} className="series-block">
+          <div className="row2">
+            <div className="field mb0">
+              <label>Name</label>
+              <input className="input" value={s.name} onChange={(e) => mutate((d) => (d.series[si].name = e.target.value))} />
+            </div>
+            <div className="field mb0">
+              <label>Conditions</label>
+              <input className="input" value={s.conditions ?? ""} onChange={(e) => mutate((d) => (d.series[si].conditions = e.target.value))} />
+            </div>
+          </div>
+          <button className="btn btn-sm btn-danger" style={{ marginTop: 10 }} onClick={() => mutate((d) => d.series.splice(si, 1))}>
+            Remove series
+          </button>
+        </div>
+      ))}
+      <button
+        className="btn btn-sm"
+        onClick={() => mutate((d) => d.series.push({ name: `Series ${d.series.length + 1}`, color: null, conditions: null, points: [{ x: 0, y: 0 }] }))}
+      >
+        + Add series
+      </button>
+    </>
+  );
+}
+
+function LabelsTab({ draft, mutate }) {
+  const anns = draft.annotations || [];
+  return (
+    <>
+      <div className="muted" style={{ marginBottom: 12 }}>
+        Reproduce the source chart's on-plot text: labels next to each line and note boxes.
+      </div>
+      <div className="field inline">
+        <input
+          type="checkbox"
+          checked={draft.inline_labels !== false}
+          onChange={(e) => mutate((d) => (d.inline_labels = e.target.checked))}
+        />
+        <label className="mb0" style={{ margin: 0 }}>Inline curve labels (name at line end)</label>
+      </div>
+      <div className="field inline">
+        <input
+          type="checkbox"
+          checked={draft.show_markers === true}
+          onChange={(e) => mutate((d) => (d.show_markers = e.target.checked))}
+        />
+        <label className="mb0" style={{ margin: 0 }}>Show point markers</label>
+      </div>
+
+      <div className="section-title" style={{ marginTop: 6 }}>Note boxes</div>
+      {anns.length === 0 && (
+        <div className="muted" style={{ marginBottom: 10 }}>None. Add a box to reproduce an in-plot note.</div>
+      )}
+      {anns.map((a, ai) => (
+        <div key={ai} className="series-block">
+          <div className="field mb0">
+            <label>Text</label>
+            <textarea
+              className="input"
+              rows={3}
+              value={a.text}
+              onChange={(e) => mutate((d) => (d.annotations[ai].text = e.target.value))}
+            />
+          </div>
+          <div className="row2" style={{ marginTop: 8 }}>
+            <div className="field mb0">
+              <label>Position</label>
+              <select
+                className="input"
+                value={a.position || "top-left"}
+                onChange={(e) => mutate((d) => (d.annotations[ai].position = e.target.value))}
+              >
+                {["top-left", "top-right", "bottom-left", "bottom-right"].map((p) => (
+                  <option key={p} value={p}>{p}</option>
+                ))}
+              </select>
+            </div>
+            <div className="field mb0" style={{ display: "flex", alignItems: "flex-end" }}>
+              <button className="btn btn-sm btn-danger" onClick={() => mutate((d) => d.annotations.splice(ai, 1))}>
+                Remove
+              </button>
+            </div>
+          </div>
+        </div>
+      ))}
+      <button
+        className="btn btn-sm"
+        onClick={() =>
+          mutate((d) => {
+            if (!d.annotations) d.annotations = [];
+            d.annotations.push({ text: "Note:", position: "top-left" });
+          })
+        }
+      >
+        + Add note box
+      </button>
+    </>
+  );
+}
+
+function SourceTab({ chart }) {
+  const c = chart.confidence || {};
+  const bar = (label, v) => {
+    const val = Math.round((v ?? 0) * 100);
+    const col = val >= 80 ? "#34d399" : val >= 60 ? "#fbbf24" : "#f87171";
+    return (
+      <div className="conf-bar" key={label}>
+        <div className="lbl"><span>{label}</span><span>{val}%</span></div>
+        <div className="conf-track"><div className="conf-fill" style={{ width: `${val}%`, background: col }} /></div>
+      </div>
+    );
+  };
+  const notes = chart.versions[0].spec.notes;
+  return (
+    <>
+      <div className="section-title" style={{ marginTop: 0 }}>Extraction confidence</div>
+      {bar("Overall", c.overall)}
+      {bar("Axes", c.axis)}
+      {bar("Legend", c.legend)}
+      {bar("Data values", c.data)}
+      {notes && (
+        <>
+          <div className="section-title">Model notes</div>
+          <div className="muted">{notes}</div>
+        </>
+      )}
+      <div className="warn-banner" style={{ marginTop: 14 }}>
+        Values read from a plotted curve are estimates. Compare against the original (left) and correct as needed.
+      </div>
+    </>
+  );
+}
+
+function HistoryTab({ chart, onJump, onFinalize, busy }) {
+  return (
+    <>
+      <div className="muted" style={{ marginBottom: 12 }}>
+        Version 0 (original extraction) is immutable. Click any version to restore it, or finalize the current one.
+      </div>
+      {chart.versions.map((v) => (
+        <div
+          key={v.version}
+          className={`version-item ${v.version === chart.current_version ? "current" : ""} ${v.kind === "original" ? "original" : ""}`}
+          onClick={() => onJump(v.version)}
+        >
+          <div>
+            <div className="vlabel">v{v.version} · {v.label}</div>
+            <div className="vmeta">{v.kind}{chart.final_version === v.version ? " · finalized" : ""}</div>
+          </div>
+          {v.version === chart.current_version && <span className="chip">current</span>}
+        </div>
+      ))}
+      <button className="btn btn-primary btn-sm" style={{ marginTop: 12, width: "100%" }} disabled={busy} onClick={onFinalize}>
+        ✓ Finalize current version
+      </button>
+    </>
+  );
+}
+
+/* ------------------------------------------------------------------ utils */
+function numOrNull(v) {
+  if (v === "" || v == null) return null;
+  const n = Number(v);
+  return Number.isNaN(n) ? null : n;
+}
+function downloadURL(url, filename) {
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}

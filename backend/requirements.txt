@@ -1,0 +1,17 @@
+# Web framework + ASGI server (with websocket support)
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+
+# PDF -> image rendering (no Poppler/system deps required; Windows friendly)
+PyMuPDF==1.25.2
+
+# Image cropping / manipulation
+Pillow==11.1.0
+
+# OpenAI SDK (Responses API + structured outputs via responses.parse)
+openai>=2.2.0
+
+# Data models / validation + .env loading
+pydantic>=2.10.0
+pydantic-settings>=2.7.0

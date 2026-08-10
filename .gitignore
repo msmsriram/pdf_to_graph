@@ -1,0 +1,29 @@
+# ---- secrets / env ----
+.env
+.env.local
+.env.*.local
+# (backend/.env.example IS committed as the template — it has no real key)
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+pdf_svg_venv/
+
+# ---- runtime storage (uploaded pdfs, page images, chart crops, manifests) ----
+storage/
+
+# ---- node / build output ----
+node_modules/
+dist/
+
+# ---- backup archives ----
+*.zip
+
+# ---- sample input pdfs (third-party datasheets — not for publishing) ----
+input_pdf/
+
+# ---- OS junk ----
+.DS_Store
+Thumbs.db
