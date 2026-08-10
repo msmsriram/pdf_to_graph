@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     # Server / storage
     storage_dir: str = "storage"
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    # Any of these frontends are allowed in addition to the explicit list above.
+    # Covers Vercel deploy URLs (which change per deploy) and Render static sites.
+    # Override with the CORS_ORIGIN_REGEX env var; set it empty to disable.
+    cors_origin_regex: str = r"^https://(pdf-to-graph[a-z0-9-]*\.vercel\.app|[a-z0-9-]+\.onrender\.com)$"
 
     @property
     def storage_path(self) -> Path:
