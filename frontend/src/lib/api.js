@@ -1,6 +1,8 @@
 import axios from "axios";
+import { API_BASE } from "./config.js";
 
-const http = axios.create({ baseURL: "/api" });
+// API_BASE is "" locally (relative -> Vite proxy) and the Render URL in prod.
+const http = axios.create({ baseURL: `${API_BASE}/api` });
 
 export const api = {
   health: () => http.get("/health").then((r) => r.data),
@@ -26,4 +28,4 @@ export const api = {
 };
 
 // Build a static asset URL for a page image / chart crop.
-export const assetUrl = (docId, rel) => `/storage/${docId}/${rel}`;
+export const assetUrl = (docId, rel) => `${API_BASE}/storage/${docId}/${rel}`;

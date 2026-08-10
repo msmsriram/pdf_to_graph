@@ -1,3 +1,5 @@
+import { wsUrl } from "./config.js";
+
 // Subscribe to the live processing feed for a document.
 // Returns a close() function. Auto-reconnects a few times on unexpected drops.
 export function subscribeDocument(documentId, onEvent) {
@@ -7,8 +9,7 @@ export function subscribeDocument(documentId, onEvent) {
 
   const connect = () => {
     if (closed) return;
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    ws = new WebSocket(`${proto}://${location.host}/ws/documents/${documentId}`);
+    ws = new WebSocket(wsUrl(`/ws/documents/${documentId}`));
 
     ws.onmessage = (msg) => {
       try {
