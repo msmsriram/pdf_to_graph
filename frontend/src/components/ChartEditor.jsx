@@ -27,6 +27,7 @@ export default function ChartEditor({ docId, chart }) {
   const [interactive, setInteractive] = useState(false);
   const [activeSeries, setActiveSeries] = useState(0);
   const [showGrid, setShowGrid] = useState(true);
+  const [printStyle, setPrintStyle] = useState(false);
 
   // Reset draft whenever the selected chart or its current version changes.
   useEffect(() => {
@@ -126,25 +127,40 @@ export default function ChartEditor({ docId, chart }) {
   };
 
   // ---- export ----
-  // Render through a dedicated offscreen instance using the print-friendly style
-  // (white background + visible gridlines) so every export matches the source
-  // chart's gridlines, regardless of the on-screen light/dark theme.
-  const renderOffscreen = (renderer) => {
+  // WYSIWYG by default: reproduce EXACTLY what's on screen — same chart option
+  // (theme, colors, gridlines, inline labels, annotations), same size, same
+  // background. We render from the spec into an offscreen instance (matched to
+  // the live chart's dimensions) so the output excludes editing-only overlays
+  // (drag handles) and hover tooltips, but is otherwise pixel-faithful.
+  // `printStyle` optionally swaps to the clean white-background print look.
+  const screenBg = theme === "dark" ? "#0a0e17" : "#f5f7fc"; // matches CSS --bg-0
+
+  const renderExport = (renderer) => {
+    const live = chartRef.current?.getEchartsInstance?.();
+    const w = live ? live.getWidth() : 900;
+    const h = live ? live.getHeight() : 500;
     const div = document.createElement("div");
-    div.style.cssText = "width:960px;height:600px;position:absolute;left:-99999px;top:0;";
+    div.style.cssText = `width:${w}px;height:${h}px;position:absolute;left:-99999px;top:0;`;
     document.body.appendChild(div);
     const inst = echarts.init(div, null, { renderer });
-    inst.setOption({ ...specToOption(draft, { theme, forExport: true, showGrid }), animation: false });
+    const opt = printStyle
+      ? { ...specToOption(draft, { theme, forExport: true, showGrid }), animation: false }
+      : { ...specToOption(draft, { theme, showGrid }), backgroundColor: screenBg, animation: false };
+    inst.setOption(opt);
     return { inst, cleanup: () => { inst.dispose(); div.remove(); } };
   };
   const exportImage = (type) => {
-    const { inst, cleanup } = renderOffscreen("canvas");
-    const url = inst.getDataURL({ type: type === "jpeg" ? "jpeg" : "png", pixelRatio: 2, backgroundColor: "#ffffff" });
+    const { inst, cleanup } = renderExport("canvas");
+    const url = inst.getDataURL({
+      type: type === "jpeg" ? "jpeg" : "png",
+      pixelRatio: 3, // crisp, high-resolution; proportions stay identical to screen
+      backgroundColor: printStyle ? "#ffffff" : screenBg,
+    });
     cleanup();
     downloadURL(url, `${draft.title || chart.chart_id}.${type}`);
   };
   const exportSVG = () => {
-    const { inst, cleanup } = renderOffscreen("svg");
+    const { inst, cleanup } = renderExport("svg");
     let svg = null;
     try {
       svg = inst.renderToSVGString ? inst.renderToSVGString() : null;
@@ -247,13 +263,21 @@ export default function ChartEditor({ docId, chart }) {
         </div>
 
         {/* export */}
-        <div style={{ display: "flex", gap: 8, marginTop: 14, flexWrap: "wrap" }}>
-          <span className="muted" style={{ alignSelf: "center" }}>Export:</span>
+        <div style={{ display: "flex", gap: 8, marginTop: 14, flexWrap: "wrap", alignItems: "center" }}>
+          <span className="muted">Export:</span>
           <button className="btn btn-sm" onClick={() => exportImage("png")}>PNG</button>
           <button className="btn btn-sm" onClick={() => exportImage("jpeg")}>JPEG</button>
           <button className="btn btn-sm" onClick={exportSVG}>SVG</button>
           <button className="btn btn-sm" onClick={() => exportData("csv")}>CSV</button>
           <button className="btn btn-sm" onClick={() => exportData("json")}>JSON</button>
+          <label
+            className="inline"
+            style={{ marginLeft: "auto", fontSize: 12, gap: 6, cursor: "pointer" }}
+            title="Off = export looks exactly like the chart on screen. On = clean white background for print."
+          >
+            <input type="checkbox" checked={printStyle} onChange={(e) => setPrintStyle(e.target.checked)} />
+            Print style (white bg)
+          </label>
         </div>
       </div>
 
