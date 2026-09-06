@@ -157,8 +157,11 @@ def find_chart(manifest: dict[str, Any], chart_id: str) -> Optional[dict[str, An
     return None
 
 
-def add_version(document_id: str, chart_id: str, spec: dict[str, Any], label: str, kind: str) -> dict[str, Any]:
-    """Append a new version to a chart and make it current. Returns the chart."""
+def add_version(
+    document_id: str, chart_id: str, spec: dict[str, Any], label: str, kind: str, extra: Optional[dict[str, Any]] = None
+) -> dict[str, Any]:
+    """Append a new version to a chart and make it current. Returns the chart.
+    `extra` (e.g. {"usage": ...}) is merged into the version record."""
     m = read_manifest(document_id)
     if not m:
         raise KeyError(document_id)
@@ -166,15 +169,16 @@ def add_version(document_id: str, chart_id: str, spec: dict[str, Any], label: st
     if not chart:
         raise KeyError(chart_id)
     next_version = len(chart["versions"])
-    chart["versions"].append(
-        {
-            "version": next_version,
-            "label": label or f"Version {next_version}",
-            "kind": kind,  # "original" | "edit"
-            "created_at": _now(),
-            "spec": spec,
-        }
-    )
+    version = {
+        "version": next_version,
+        "label": label or f"Version {next_version}",
+        "kind": kind,  # "original" | "edit" | "rerun"
+        "created_at": _now(),
+        "spec": spec,
+    }
+    if extra:
+        version.update(extra)
+    chart["versions"].append(version)
     chart["current_version"] = next_version
     m["updated_at"] = _now()
     write_manifest(m)

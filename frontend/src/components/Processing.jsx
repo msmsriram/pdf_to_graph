@@ -8,7 +8,7 @@ import { specToOption } from "../lib/chartOption.js";
 const STEPS = [
   { key: "uploaded", label: "Uploaded" },
   { key: "rendering", label: "Rendering pages to images" },
-  { key: "analyzing", label: "Understanding pages with gpt-5.6-sol" },
+  { key: "analyzing", label: "Understanding pages with the vision model" },
   { key: "complete", label: "Reconstructing & ready" },
 ];
 const ORDER = ["uploaded", "rendering", "analyzing", "complete"];
@@ -114,7 +114,7 @@ export default function Processing() {
           {liveCharts.length === 0 ? (
             <div className="empty-state" style={{ padding: "40px 10px" }}>
               <div className="icon">📊</div>
-              Charts will pop in here as gpt-5.6-sol finds them.
+              Charts will pop in here as the model finds them.
             </div>
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 12, maxHeight: 460, overflowY: "auto" }}>
@@ -132,7 +132,7 @@ export default function Processing() {
                         <span style={{ fontSize: 12, fontWeight: 600 }}>{spec.title || c.chart_id}</span>
                         <span className="chip">page {c.page_number}</span>
                       </div>
-                      <ReactECharts option={specToOption(spec, { theme })} style={{ height: 200 }} notMerge lazyUpdate />
+                      <ReactECharts option={specToOption(spec, { theme, scale: 0.75 })} style={{ height: 200 }} notMerge lazyUpdate />
                     </motion.div>
                   );
                 })}

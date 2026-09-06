@@ -25,6 +25,9 @@ export const api = {
   setVersion: (docId, chartId, version) =>
     http.post(`/documents/${docId}/charts/${chartId}/set-version/${version}`).then((r) => r.data),
   finalize: (docId, chartId) => http.post(`/documents/${docId}/charts/${chartId}/finalize`).then((r) => r.data),
+  // Re-extract one chart at a higher reasoning effort; returns the updated chart (new version appended).
+  rerunChart: (docId, chartId, opts) =>
+    http.post(`/documents/${docId}/charts/${chartId}/rerun`, opts || {}).then((r) => r.data),
 };
 
 // Build a static asset URL for a page image / chart crop.

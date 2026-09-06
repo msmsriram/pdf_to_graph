@@ -7,10 +7,11 @@ events. Every meaningful step emits an event on the bus for the live UI.
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 
-from . import pdf_processor, storage
+from . import costs, pdf_processor, storage, style_metrics
 from .config import get_settings
 from .events import bus
 from .openai_client import extract_page
@@ -96,8 +97,8 @@ async def process_document(document_id: str) -> None:
             await _emit(document_id, {"type": "progress", "progress": m["progress"]})
 
         # -------- 2. Analyze each page (sequential for continuity) --------
-        await _emit(document_id, {"type": "status", "status": "analyzing", "message": "Analyzing pages with gpt-5.6-sol"})
-        storage.set_status(document_id, "analyzing", "Analyzing pages with gpt-5.6-sol")
+        await _emit(document_id, {"type": "status", "status": "analyzing", "message": f"Analyzing pages with {settings.openai_model}"})
+        storage.set_status(document_id, "analyzing", f"Analyzing pages with {settings.openai_model}")
 
         running_notes = ""
         for pm in pages_meta:
@@ -105,9 +106,11 @@ async def process_document(document_id: str) -> None:
             page_png = d / "pages" / pm["filename"]
             await _emit(document_id, {"type": "status", "status": "analyzing",
                                       "message": f"Reading page {page_no} of {capped}"})
-            await _log(document_id, f"Sending page {page_no} to gpt-5.6-sol ({settings.reasoning_effort} reasoning)…")
+            await _log(document_id, f"Sending page {page_no} to {settings.openai_model} ({settings.reasoning_effort} reasoning)…")
 
-            extraction = await asyncio.to_thread(extract_page, page_png, page_no, running_notes)
+            t0 = time.perf_counter()
+            extraction, usage = await asyncio.to_thread(extract_page, page_png, page_no, running_notes)
+            usage["seconds"] = round(time.perf_counter() - t0, 2)
             running_notes = (extraction.updated_running_notes or running_notes)[:2000]
 
             m = storage.read_manifest(document_id)
@@ -115,6 +118,11 @@ async def process_document(document_id: str) -> None:
             page_entry["summary"] = extraction.summary
             page_entry["has_charts"] = bool(extraction.charts)
             m["progress"]["pages_analyzed"] += 1
+            # token/cost accounting for this page (API-billed counts x list price)
+            ublock = costs.ensure_usage_block(m, settings.openai_model)
+            usage["cost_usd"] = costs.cost_usd(usage, ublock["pricing"])
+            page_entry["usage"] = usage
+            costs.add_to_totals(ublock["totals"], usage)
 
             created_charts: list[dict] = []
             for idx, ec in enumerate(extraction.charts, start=1):
@@ -132,7 +140,11 @@ async def process_document(document_id: str) -> None:
                     {"type": "chart_detected", "chart_id": chart_id, "page_number": page_no, "crop_image": crop_rel},
                 )
 
-                spec = _spec_from_extracted(ec)
+                spec = _spec_from_extracted(ec, crop_box=crop_meta.get("box_norm"))
+                # measure the original's stroke weight / text size from the crop (no model call)
+                spec["style_metrics"] = await asyncio.to_thread(
+                    style_metrics.measure, d / "charts" / f"{chart_id}.png", spec.get("plot_rect"), spec
+                )
                 chart_obj = {
                     "chart_id": chart_id,
                     "page_number": page_no,
@@ -162,6 +174,22 @@ async def process_document(document_id: str) -> None:
 
             m["charts_count"] = len(m["charts"])
             storage.write_manifest(m)
+            await _emit(
+                document_id,
+                {
+                    "type": "usage",
+                    "page_number": page_no,
+                    "usage": usage,
+                    "totals": ublock["totals"],
+                    "model": ublock["model"],
+                    "pricing": ublock["pricing"],
+                },
+            )
+            await _log(
+                document_id,
+                f"Page {page_no}: {usage['input_tokens']:,} in / {usage['output_tokens']:,} out tokens "
+                f"→ ${usage['cost_usd']:.4f} in {usage['seconds']}s",
+            )
 
             # write per-page XML artifact
             xml = _page_xml(page_no, extraction.summary, created_charts)
@@ -187,7 +215,34 @@ async def process_document(document_id: str) -> None:
         await _emit(document_id, {"type": "error", "message": str(exc)})
 
 
-def _spec_from_extracted(ec: ExtractedChart) -> dict:
+def _plot_rect_in_crop(plot: list[float] | None, crop_box: list[float] | None) -> list[float] | None:
+    """Map the model's plot-area rectangle into the crop's own frame (0..1).
+
+    `crop_box` is the crop rectangle in page-normalized coords (page flow). When it is
+    None the plot rectangle is already relative to the crop (single-chart re-extraction).
+    Returns None for missing/implausible rectangles so the UI simply hides the overlay.
+    """
+    if not plot or len(plot) != 4:
+        return None
+    try:
+        x0, y0, x1, y1 = [float(v) for v in plot]
+        if crop_box:
+            cx0, cy0, cx1, cy1 = [float(v) for v in crop_box]
+            cw, ch = cx1 - cx0, cy1 - cy0
+            if cw <= 0 or ch <= 0:
+                return None
+            x0, x1 = (x0 - cx0) / cw, (x1 - cx0) / cw
+            y0, y1 = (y0 - cy0) / ch, (y1 - cy0) / ch
+        clamp = lambda v: max(0.0, min(1.0, v))  # noqa: E731
+        x0, y0, x1, y1 = clamp(x0), clamp(y0), clamp(x1), clamp(y1)
+        if x1 - x0 < 0.2 or y1 - y0 < 0.2:
+            return None
+        return [round(x0, 4), round(y0, 4), round(x1, 4), round(y1, 4)]
+    except (TypeError, ValueError):
+        return None
+
+
+def _spec_from_extracted(ec: ExtractedChart, crop_box: list[float] | None = None) -> dict:
     """Convert the model's ExtractedChart into the stored/editable ChartSpec dict."""
     return {
         "title": ec.title,
@@ -200,7 +255,9 @@ def _spec_from_extracted(ec: ExtractedChart) -> dict:
         "legend": ec.legend,
         "inline_labels": ec.inline_labels,
         "show_markers": ec.show_markers,
+        "smooth": ec.smooth,
         "annotations": [a.model_dump() for a in ec.annotations],
+        "plot_rect": _plot_rect_in_crop(ec.plot_bbox, crop_box),
         "notes": ec.notes,
         "confidence": ec.confidence.model_dump(),
     }

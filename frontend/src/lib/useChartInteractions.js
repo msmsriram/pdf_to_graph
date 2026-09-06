@@ -17,7 +17,9 @@ const tidy = (v) => {
  * the chart behaves exactly as before. Commits flow back through onCommitPoint /
  * onAddPoint, which update the same React `draft` (dirty -> Save version).
  */
-export function useDraggablePoints({ chartRef, draft, theme, enabled, activeSeries, onCommitPoint, onAddPoint }) {
+// `refreshKey`: any value whose change should rebuild the handles (e.g. the chart
+// being re-mounted after a view switch), since a ref change alone doesn't re-run effects.
+export function useDraggablePoints({ chartRef, draft, theme, enabled, activeSeries, onCommitPoint, onAddPoint, refreshKey }) {
   useEffect(() => {
     const inst = chartRef.current?.getEchartsInstance?.();
     if (!inst) return;
@@ -130,5 +132,5 @@ export function useDraggablePoints({ chartRef, draft, theme, enabled, activeSeri
       if (ro) ro.disconnect();
       clearHandles();
     };
-  }, [enabled, activeSeries, theme, draft, chartRef, onCommitPoint, onAddPoint]);
+  }, [enabled, activeSeries, theme, draft, chartRef, onCommitPoint, onAddPoint, refreshKey]);
 }

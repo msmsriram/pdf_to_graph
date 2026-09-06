@@ -19,7 +19,7 @@ class Settings(BaseSettings):
 
     # OpenAI
     openai_api_key: str = ""
-    openai_model: str = "gpt-5.6-sol"
+    openai_model: str = "gpt-6-astra"
     reasoning_effort: str = "high"
     image_detail: str = "original"
 

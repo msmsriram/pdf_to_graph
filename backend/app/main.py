@@ -6,7 +6,9 @@ Static-> /storage serves page images and chart crops.
 """
 from __future__ import annotations
 
+import asyncio
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -18,10 +20,13 @@ from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSock
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from . import pipeline, storage
+from . import costs, pipeline, storage, style_metrics
 from .config import get_settings
 from .events import bus
-from .schemas import SaveVersionRequest
+from .openai_client import extract_single_chart
+from .schemas import RerunRequest, SaveVersionRequest
+
+REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max"}
 
 settings = get_settings()
 app = FastAPI(title="PDF Chart Studio API", version="1.0.0")
@@ -81,7 +86,31 @@ async def get_document(document_id: str) -> dict:
     m = storage.read_manifest(document_id)
     if not m:
         raise HTTPException(status_code=404, detail="Document not found")
+    # Charts extracted before stroke/text measurement existed get measured on first open.
+    if await asyncio.to_thread(_ensure_style_metrics, m, document_id):
+        storage.write_manifest(m)
     return m
+
+
+def _ensure_style_metrics(m: dict, document_id: str) -> bool:
+    """Stamp `style_metrics` (derived from the crop image) on every version lacking it."""
+    changed = False
+    for chart in m.get("charts", []):
+        versions = chart.get("versions", [])
+        if all(v.get("spec", {}).get("style_metrics") for v in versions):
+            continue
+        crop = storage.doc_dir(document_id) / chart["crop_image"]
+        if not crop.exists():
+            continue
+        cur = versions[chart.get("current_version", 0)]["spec"] if versions else {}
+        metrics = style_metrics.measure(crop, cur.get("plot_rect"), cur)
+        if not metrics:
+            continue
+        for v in versions:
+            if not v.get("spec", {}).get("style_metrics"):
+                v["spec"]["style_metrics"] = metrics
+                changed = True
+    return changed
 
 
 @app.delete("/api/documents/{document_id}")
@@ -134,6 +163,52 @@ async def finalize(document_id: str, chart_id: str) -> dict:
         return storage.finalize_chart(document_id, chart_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Document or chart not found")
+
+
+@app.post("/api/documents/{document_id}/charts/{chart_id}/rerun")
+async def rerun_chart(document_id: str, chart_id: str, body: RerunRequest) -> dict:
+    """Re-extract ONE chart from its crop (optionally at a higher reasoning effort /
+    different model) and append the result as a new version. v0 is never touched."""
+    m = storage.read_manifest(document_id)
+    if not m:
+        raise HTTPException(status_code=404, detail="Document not found")
+    chart = storage.find_chart(m, chart_id)
+    if not chart:
+        raise HTTPException(status_code=404, detail="Chart not found")
+    if body.effort and body.effort not in REASONING_EFFORTS:
+        raise HTTPException(status_code=400, detail=f"effort must be one of {sorted(REASONING_EFFORTS)}")
+
+    crop = storage.doc_dir(document_id) / chart["crop_image"]
+    if not crop.exists():
+        raise HTTPException(status_code=404, detail="Chart crop image is missing")
+
+    prior = chart["versions"][chart["current_version"]]["spec"]
+    t0 = time.perf_counter()
+    try:
+        ec, usage = await asyncio.to_thread(extract_single_chart, crop, prior, body.effort, body.model)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Re-extraction failed: {exc}")
+    usage["seconds"] = round(time.perf_counter() - t0, 2)
+    usage["cost_usd"] = costs.cost_usd(usage, costs.pricing_for(usage["model"]))
+
+    spec = pipeline._spec_from_extracted(ec)
+    spec["style_metrics"] = await asyncio.to_thread(style_metrics.measure, crop, spec.get("plot_rect"), spec)
+    chart_out = storage.add_version(
+        document_id,
+        chart_id,
+        spec,
+        label=f"Re-extracted · {usage['model']} · {usage['effort']}",
+        kind="rerun",
+        extra={"usage": usage},
+    )
+
+    # Document-level accounting: list the re-run and add it to the totals.
+    m2 = storage.read_manifest(document_id)
+    ublock = costs.ensure_usage_block(m2, settings.openai_model)
+    ublock["reruns"].append({"chart_id": chart_id, "version": chart_out["current_version"], "at": storage._now(), **usage})
+    costs.add_to_totals(ublock["totals"], usage)
+    storage.write_manifest(m2)
+    return chart_out
 
 
 # --------------------------------------------------------------------------- #

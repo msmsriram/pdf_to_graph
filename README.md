@@ -4,7 +4,7 @@ Upload a PDF → every chart in it is detected, reconstructed as an **editable**
 and rendered in a workspace where you can change data/colors/axes, keep an immutable
 original, step back through versions, finalize, and export (PNG/JPEG/SVG/CSV/JSON).
 
-Model: **gpt-5.6-sol** (OpenAI Responses API, direct — not Bedrock), with structured
+Model: **gpt-6-astra** (OpenAI Responses API, direct — not Bedrock), with structured
 outputs and rolling page-to-page continuity.
 
 ---
@@ -25,7 +25,7 @@ copy .env.example .env      # then edit .env and paste your OPENAI_API_KEY
 uvicorn app.main:app --reload --port 8000
 ```
 
-Health check: open http://localhost:8000/api/health → should show `{"ok":true,"model":"gpt-5.6-sol","has_key":true}`.
+Health check: open http://localhost:8000/api/health → should show `{"ok":true,"model":"gpt-6-astra","has_key":true}`.
 
 ## 2. Frontend (React + Vite)
 
@@ -80,7 +80,7 @@ backend/storage/
 
 ## 5. Tunables (`backend/.env`)
 
-- `OPENAI_MODEL` — default `gpt-5.6-sol`. **If the API rejects the id, change only this.**
+- `OPENAI_MODEL` — default `gpt-6-astra`. **If the API rejects the id, change only this.**
 - `REASONING_EFFORT` — `high` (accuracy) down to `low` (cheaper/faster).
 - `IMAGE_DETAIL` — `original` best for dense charts; `low` is cheaper.
 - `RENDER_DPI` — 150–200 sweet spot.
@@ -90,7 +90,7 @@ backend/storage/
 
 ## 6. MVP scope / honest limits
 
-- Chart **values are gpt-5.6-sol estimates** unless printed on the source. The UI shows
+- Chart **values are gpt-6-astra estimates** unless printed on the source. The UI shows
   the original crop side-by-side and per-field confidence so you can verify/correct.
 - Chart detection + data extraction are done by the model in one pass (the deterministic
   pixel-tracing digitizer is a planned Phase-2 accuracy upgrade).

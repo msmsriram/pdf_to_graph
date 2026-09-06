@@ -13,7 +13,10 @@ const TABS = ["Data", "Style", "Axes", "Series", "Labels", "Source", "History"];
 
 export default function ChartEditor({ docId, chart }) {
   const updateChart = useStore((s) => s.updateChart);
+  const setDocument = useStore((s) => s.setDocument);
   const theme = useStore((s) => s.theme);
+  const rightRailOpen = useStore((s) => s.rightRailOpen);
+  const setRail = useStore((s) => s.setRail);
   const [tab, setTab] = useState("Data");
   const chartRef = useRef(null);
 
@@ -28,6 +31,37 @@ export default function ChartEditor({ docId, chart }) {
   const [activeSeries, setActiveSeries] = useState(0);
   const [showGrid, setShowGrid] = useState(true);
   const [printStyle, setPrintStyle] = useState(false);
+  const [rerunEffort, setRerunEffort] = useState("xhigh");
+  const [rerunBusy, setRerunBusy] = useState(false);
+  const [rerunError, setRerunError] = useState(null);
+  // Geometry: both stage panes keep the ORIGINAL crop's aspect ratio (measured from the
+  // crop image itself, so it works for every chart) and all sizes scale with width.
+  const [stageW, setStageW] = useState(0);
+  const [cropAspect, setCropAspect] = useState(0.62); // height / width
+  const stageRef = useRef(null);
+  const [view, setView] = useState("side"); // "side" | "overlay" | "only"
+  const [opacity, setOpacity] = useState(0.65);
+
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setStageW(el.clientWidth));
+    ro.observe(el);
+    setStageW(el.clientWidth);
+    return () => ro.disconnect();
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    const img = new Image();
+    img.onload = () => {
+      if (alive && img.naturalWidth > 0) setCropAspect(img.naturalHeight / img.naturalWidth);
+    };
+    img.src = assetUrl(docId, chart.crop_image);
+    return () => {
+      alive = false;
+    };
+  }, [docId, chart.crop_image]);
 
   // Reset draft whenever the selected chart or its current version changes.
   useEffect(() => {
@@ -36,7 +70,33 @@ export default function ChartEditor({ docId, chart }) {
     setActiveSeries(0);
   }, [chart.chart_id, chart.current_version]);
 
-  const option = useMemo(() => specToOption(draft, { theme, showGrid }), [draft, theme, showGrid]);
+  // Overlay needs the plot-area rectangle the model reports (older charts: Re-extract).
+  const hasRect = Array.isArray(draft.plot_rect) && draft.plot_rect.length === 4;
+  useEffect(() => {
+    if (view === "overlay" && !hasRect) setView("side");
+  }, [view, hasRect]);
+
+  // Pane size: side-by-side splits the stage width in two; every mode is capped by the
+  // viewport height so the stage fits without scrolling. Whichever limit binds, the
+  // aspect ratio stays the crop's. scale=1 corresponds to a ~560px-wide pane.
+  const { paneW, paneH, scale, stacked } = useMemo(() => {
+    const W = Math.max(280, stageW || 900);
+    const maxH = Math.max(260, (typeof window !== "undefined" ? window.innerHeight : 900) - 330);
+    const stacked = view === "side" && W < 760;
+    const avail = view === "side" && !stacked ? (W - 16) / 2 : W;
+    const w = Math.max(240, Math.min(avail, maxH / cropAspect));
+    return { paneW: Math.round(w), paneH: Math.max(160, Math.round(w * cropAspect)), scale: w / 560, stacked };
+  }, [stageW, cropAspect, view]);
+
+  // `height` lets the renderer size strokes/text from the crop's measured proportions.
+  const option = useMemo(
+    () => specToOption(draft, { theme, showGrid, scale, width: paneW, height: paneH }),
+    [draft, theme, showGrid, scale, paneW, paneH]
+  );
+  const overlayOpt = useMemo(
+    () => specToOption(draft, { theme, showGrid, scale, width: paneW, height: paneH, overlay: true, plotRect: hasRect ? draft.plot_rect : null }),
+    [draft, theme, showGrid, scale, paneW, paneH, hasRect]
+  );
 
   const mutate = (fn) => {
     setDraft((d) => {
@@ -78,6 +138,7 @@ export default function ChartEditor({ docId, chart }) {
     activeSeries,
     onCommitPoint: commitPoint,
     onAddPoint: addPointToSeries,
+    refreshKey: view, // the editable chart re-mounts when the view changes
   });
 
   const saveVersion = async () => {
@@ -126,6 +187,23 @@ export default function ChartEditor({ docId, chart }) {
     setDirty(false);
   };
 
+  // Re-run extraction for this chart only (higher effort). Appends a new version;
+  // the editor's reset effect then loads it as the current draft.
+  const rerun = async () => {
+    setRerunBusy(true);
+    setRerunError(null);
+    try {
+      const updated = await api.rerunChart(docId, chart.chart_id, { effort: rerunEffort });
+      updateChart(updated);
+      // refresh document-level usage/cost (the re-run is added to the totals)
+      api.getDocument(docId).then(setDocument).catch(() => {});
+    } catch (e) {
+      setRerunError(e?.response?.data?.detail || "Re-extraction failed");
+    } finally {
+      setRerunBusy(false);
+    }
+  };
+
   // ---- export ----
   // WYSIWYG by default: reproduce EXACTLY what's on screen — same chart option
   // (theme, colors, gridlines, inline labels, annotations), same size, same
@@ -136,16 +214,17 @@ export default function ChartEditor({ docId, chart }) {
   const screenBg = theme === "dark" ? "#0a0e17" : "#f5f7fc"; // matches CSS --bg-0
 
   const renderExport = (renderer) => {
-    const live = chartRef.current?.getEchartsInstance?.();
-    const w = live ? live.getWidth() : 900;
-    const h = live ? live.getHeight() : 500;
+    // same size and aspect as the on-screen pane (works in every view mode)
+    const w = paneW;
+    const h = paneH;
     const div = document.createElement("div");
     div.style.cssText = `width:${w}px;height:${h}px;position:absolute;left:-99999px;top:0;`;
     document.body.appendChild(div);
     const inst = echarts.init(div, null, { renderer });
+    const exportScale = w / 560; // same proportions as on screen
     const opt = printStyle
-      ? { ...specToOption(draft, { theme, forExport: true, showGrid }), animation: false }
-      : { ...specToOption(draft, { theme, showGrid }), backgroundColor: screenBg, animation: false };
+      ? { ...specToOption(draft, { theme, forExport: true, showGrid, scale: exportScale, width: w, height: h }), animation: false }
+      : { ...specToOption(draft, { theme, showGrid, scale: exportScale, width: w, height: h }), backgroundColor: screenBg, animation: false };
     inst.setOption(opt);
     return { inst, cleanup: () => { inst.dispose(); div.remove(); } };
   };
@@ -188,10 +267,10 @@ export default function ChartEditor({ docId, chart }) {
   };
 
   return (
-    <div className="card editor">
-      {/* ---- main: chart + compare ---- */}
-      <div className="editor-main">
-        <div style={{ display: "flex", alignItems: "center", marginBottom: 12 }}>
+    <div className="ws-editor">
+      {/* ---- centre stage: original | reconstructed ---- */}
+      <section className="stage">
+        <div className="stage-head">
           <div>
             <div style={{ fontSize: 16, fontWeight: 650 }}>{draft.title || chart.chart_id}</div>
             <div className="muted">
@@ -200,11 +279,62 @@ export default function ChartEditor({ docId, chart }) {
             </div>
           </div>
           <div className="spacer" />
+          <div
+            className="inline"
+            style={{ gap: 6, marginRight: 12 }}
+            title="Re-run extraction for THIS chart at a higher reasoning effort. Adds a new version; the original v0 stays untouched."
+          >
+            <select
+              className="input"
+              style={{ width: "auto", padding: "6px 9px", fontSize: 12 }}
+              value={rerunEffort}
+              onChange={(e) => setRerunEffort(e.target.value)}
+              disabled={rerunBusy}
+            >
+              <option value="high">effort: high</option>
+              <option value="xhigh">effort: xhigh</option>
+              <option value="max">effort: max</option>
+            </select>
+            <button className="btn btn-sm" onClick={rerun} disabled={rerunBusy || busy}>
+              {rerunBusy ? (
+                <>
+                  <span className="pipe-spin" style={{ display: "inline-block" }} /> Re-extracting…
+                </>
+              ) : (
+                "↻ Re-extract"
+              )}
+            </button>
+          </div>
           {dirty && <span className="dirty-badge">● unsaved edits</span>}
         </div>
+        {rerunError && <div className="warn-banner">⚠ {rerunError}</div>}
 
-        {/* interactive toolbar */}
-        <div className="chart-toolbar">
+        {/* view + interaction toolbar */}
+        <div className="stage-toolbar">
+          <div className="seg" title="How to show the original and the reconstruction">
+            {[
+              ["side", "Side by side"],
+              ["overlay", "Overlay"],
+              ["only", "Chart only"],
+            ].map(([m, label]) => (
+              <button
+                key={m}
+                className={`seg-btn ${view === m ? "active" : ""}`}
+                disabled={m === "overlay" && !hasRect}
+                title={m === "overlay" && !hasRect ? "Re-extract this chart once to capture the plot-area position needed for the overlay" : ""}
+                onClick={() => setView(m)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {view === "overlay" && (
+            <label className="inline" style={{ gap: 6, fontSize: 12 }}>
+              opacity
+              <input type="range" min="0.1" max="1" step="0.05" value={opacity} onChange={(e) => setOpacity(Number(e.target.value))} />
+            </label>
+          )}
+          <div className="spacer" />
           <button
             className={`btn btn-sm ${interactive ? "btn-primary" : ""}`}
             onClick={() => setInteractive((v) => !v)}
@@ -233,7 +363,6 @@ export default function ChartEditor({ docId, chart }) {
             </>
           )}
           {draft.chart_type === "pie" && <span className="muted">drag editing not available for pie</span>}
-          <div className="spacer" />
           <button
             className={`btn btn-sm ${showGrid ? "btn-primary" : ""}`}
             onClick={() => setShowGrid((v) => !v)}
@@ -244,26 +373,52 @@ export default function ChartEditor({ docId, chart }) {
           <button className="btn btn-sm" onClick={addSeries}>+ Add line / series</button>
         </div>
 
-        <div className="chart-canvas">
-          <ReactECharts ref={chartRef} option={option} style={{ height: 420 }} notMerge lazyUpdate opts={{ renderer: "canvas" }} />
-        </div>
-
-        {/* original vs reconstruction */}
-        <div className="compare">
-          <div className="compare-pane">
-            <div className="cap">Original (from PDF)</div>
-            <img src={assetUrl(docId, chart.crop_image)} alt="original chart" />
-          </div>
-          <div className="compare-pane">
-            <div className="cap">Reconstructed (editable)</div>
-            <div style={{ background: "var(--bg-0)" }}>
-              <ReactECharts option={option} style={{ height: 220 }} notMerge lazyUpdate />
+        {/* the two panes: identical size and aspect ratio (the crop's) */}
+        <div className={`stage-body ${stacked ? "stacked" : ""}`} ref={stageRef}>
+          {view !== "only" && (
+            <div className="pane" style={{ width: paneW }}>
+              <div className="pane-cap">
+                <span>Original (PDF)</span>
+                {view === "overlay" && <span>+ our curves at {Math.round(opacity * 100)}%</span>}
+              </div>
+              <div className="pane-box" style={{ height: paneH }}>
+                <img className="cmp-layer" src={assetUrl(docId, chart.crop_image)} alt="original chart" />
+                {view === "overlay" && (
+                  <div className="cmp-layer" style={{ opacity, pointerEvents: "none" }}>
+                    <ReactECharts option={overlayOpt} style={{ width: "100%", height: "100%" }} notMerge lazyUpdate />
+                  </div>
+                )}
+              </div>
             </div>
-          </div>
+          )}
+          {view !== "overlay" && (
+            <div className="pane" style={{ width: paneW }}>
+              <div className="pane-cap">
+                <span>Reconstructed · editable</span>
+                {interactive && draft.chart_type !== "pie" && <span>drag points · double-click adds</span>}
+              </div>
+              <div className="pane-box chart-canvas" style={{ height: paneH }}>
+                <ReactECharts
+                  ref={chartRef}
+                  option={option}
+                  style={{ width: "100%", height: "100%" }}
+                  notMerge
+                  lazyUpdate
+                  opts={{ renderer: "canvas" }}
+                />
+              </div>
+            </div>
+          )}
         </div>
+        {view === "overlay" && (
+          <div className="muted">Our curves drawn over the PDF crop at the same size — any offset you see is real. Edit, or re-extract.</div>
+        )}
+        {!hasRect && (
+          <div className="muted">Overlay needs the plot-area position: press ↻ Re-extract once on this chart to capture it.</div>
+        )}
 
         {/* export */}
-        <div style={{ display: "flex", gap: 8, marginTop: 14, flexWrap: "wrap", alignItems: "center" }}>
+        <div className="stage-export">
           <span className="muted">Export:</span>
           <button className="btn btn-sm" onClick={() => exportImage("png")}>PNG</button>
           <button className="btn btn-sm" onClick={() => exportImage("jpeg")}>JPEG</button>
@@ -279,41 +434,70 @@ export default function ChartEditor({ docId, chart }) {
             Print style (white bg)
           </label>
         </div>
-      </div>
+      </section>
 
-      {/* ---- side: tabbed editor ---- */}
-      <div className="editor-side">
-        <div className="tabs">
-          {TABS.map((t) => (
-            <div key={t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
-              {t}
+      {/* ---- right rail: tabbed editor (collapses to a vertical tab strip) ---- */}
+      <aside className={`rail rail-right ${rightRailOpen ? "" : "collapsed"}`}>
+        {rightRailOpen ? (
+          <>
+            <div className="rail-head">
+              <span>Editor{dirty ? " · unsaved" : ""}</span>
+              <button className="rail-toggle" onClick={() => setRail("right", false)} title="Collapse editor  ]">
+                ▸
+              </button>
             </div>
-          ))}
-        </div>
-        <div className="tab-body">
-          {tab === "Data" && <DataTab draft={draft} mutate={mutate} addSeries={addSeries} />}
-          {tab === "Style" && <StyleTab draft={draft} mutate={mutate} />}
-          {tab === "Axes" && <AxesTab draft={draft} mutate={mutate} />}
-          {tab === "Series" && <SeriesTab draft={draft} mutate={mutate} />}
-          {tab === "Labels" && <LabelsTab draft={draft} mutate={mutate} />}
-          {tab === "Source" && <SourceTab chart={chart} />}
-          {tab === "History" && (
-            <HistoryTab chart={chart} onJump={jumpToVersion} onFinalize={finalize} busy={busy} />
-          )}
-        </div>
-
-        <div className="editor-actions">
-          <button className="btn btn-primary btn-sm" disabled={!dirty || busy} onClick={saveVersion}>
-            Save as new version
-          </button>
-          <button className="btn btn-sm" disabled={!dirty} onClick={resetDraft}>
-            Discard
-          </button>
-          <button className="btn btn-sm" disabled={chart.current_version === 0 || busy} onClick={revert}>
-            ↶ Revert one
-          </button>
-        </div>
-      </div>
+            <div className="tabs">
+              {TABS.map((t) => (
+                <div key={t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
+                  {t}
+                </div>
+              ))}
+            </div>
+            <div className="tab-body">
+              {tab === "Data" && <DataTab draft={draft} mutate={mutate} addSeries={addSeries} />}
+              {tab === "Style" && <StyleTab draft={draft} mutate={mutate} />}
+              {tab === "Axes" && <AxesTab draft={draft} mutate={mutate} />}
+              {tab === "Series" && <SeriesTab draft={draft} mutate={mutate} />}
+              {tab === "Labels" && <LabelsTab draft={draft} mutate={mutate} />}
+              {tab === "Source" && <SourceTab chart={chart} />}
+              {tab === "History" && (
+                <HistoryTab chart={chart} onJump={jumpToVersion} onFinalize={finalize} busy={busy} />
+              )}
+            </div>
+            <div className="editor-actions">
+              <button className="btn btn-primary btn-sm" disabled={!dirty || busy} onClick={saveVersion}>
+                Save as new version
+              </button>
+              <button className="btn btn-sm" disabled={!dirty} onClick={resetDraft}>
+                Discard
+              </button>
+              <button className="btn btn-sm" disabled={chart.current_version === 0 || busy} onClick={revert}>
+                ↶ Revert one
+              </button>
+            </div>
+          </>
+        ) : (
+          <div className="rail-strip">
+            <button className="rail-toggle" onClick={() => setRail("right", true)} title="Expand editor  ]">
+              ◂
+            </button>
+            {TABS.map((t) => (
+              <button
+                key={t}
+                className={`vtab ${tab === t ? "active" : ""}`}
+                onClick={() => {
+                  setTab(t);
+                  setRail("right", true);
+                }}
+                title={`Open ${t}`}
+              >
+                {t}
+              </button>
+            ))}
+            {dirty && <span className="vdot" title="Unsaved edits" />}
+          </div>
+        )}
+      </aside>
     </div>
   );
 }
@@ -323,7 +507,7 @@ function DataTab({ draft, mutate, addSeries }) {
   return (
     <>
       <div className="muted" style={{ marginBottom: 12 }}>
-        Edit any value — the chart updates instantly. Values are gpt-5.6-sol estimates unless printed on the source.
+        Edit any value — the chart updates instantly. Values are model estimates unless printed on the source.
       </div>
       {draft.series.map((s, si) => (
         <div key={si} className="series-block">
@@ -460,6 +644,24 @@ function AxisFields({ axis, onChange }) {
           </div>
         </div>
       </div>
+      <div className="field inline">
+        <input type="checkbox" checked={axis.inverse === true} onChange={(e) => onChange({ ...axis, inverse: e.target.checked })} />
+        <label className="mb0" style={{ margin: 0 }} title="Values decrease along the axis: up for Y (e.g. 0 at the bottom, -1 at the top), right for X">
+          Inverted direction (values decrease upward / rightward)
+        </label>
+      </div>
+      {axis.scale !== "log" && (
+        <div className="row2">
+          <div className="field">
+            <label>Major tick step</label>
+            <input className="input" type="number" placeholder="auto" value={axis.major_interval ?? ""} onChange={(e) => onChange({ ...axis, major_interval: numOrNull(e.target.value) })} />
+          </div>
+          <div className="field">
+            <label>Minor grid step</label>
+            <input className="input" type="number" placeholder="none" value={axis.minor_interval ?? ""} onChange={(e) => onChange({ ...axis, minor_interval: numOrNull(e.target.value) })} />
+          </div>
+        </div>
+      )}
     </>
   );
 }
@@ -488,6 +690,30 @@ function SeriesTab({ draft, mutate }) {
             <div className="field mb0">
               <label>Conditions</label>
               <input className="input" value={s.conditions ?? ""} onChange={(e) => mutate((d) => (d.series[si].conditions = e.target.value))} />
+            </div>
+          </div>
+          <div className="row2" style={{ marginTop: 8 }}>
+            <div className="field mb0">
+              <label>Label X (on plot)</label>
+              <input className="input" type="number" placeholder="line end" value={s.label_x ?? ""} onChange={(e) => mutate((d) => (d.series[si].label_x = numOrNull(e.target.value)))} />
+            </div>
+            <div className="field mb0">
+              <label>Label Y (on plot)</label>
+              <input className="input" type="number" placeholder="line end" value={s.label_y ?? ""} onChange={(e) => mutate((d) => (d.series[si].label_y = numOrNull(e.target.value)))} />
+            </div>
+          </div>
+          <div className="row2" style={{ marginTop: 8 }}>
+            <div className="field inline mb0" style={{ alignSelf: "end" }}>
+              <input type="checkbox" checked={s.label_boxed === true} onChange={(e) => mutate((d) => (d.series[si].label_boxed = e.target.checked))} />
+              <label className="mb0" style={{ margin: 0 }}>Boxed label</label>
+            </div>
+            <div className="field mb0">
+              <label>Line weight</label>
+              <select className="input" value={s.line_width ?? "medium"} onChange={(e) => mutate((d) => (d.series[si].line_width = e.target.value))}>
+                <option value="thin">thin</option>
+                <option value="medium">medium</option>
+                <option value="thick">thick</option>
+              </select>
             </div>
           </div>
           <button className="btn btn-sm btn-danger" style={{ marginTop: 10 }} onClick={() => mutate((d) => d.series.splice(si, 1))}>
@@ -527,6 +753,14 @@ function LabelsTab({ draft, mutate }) {
           onChange={(e) => mutate((d) => (d.show_markers = e.target.checked))}
         />
         <label className="mb0" style={{ margin: 0 }}>Show point markers</label>
+      </div>
+      <div className="field inline">
+        <input
+          type="checkbox"
+          checked={draft.smooth !== false}
+          onChange={(e) => mutate((d) => (d.smooth = e.target.checked))}
+        />
+        <label className="mb0" style={{ margin: 0 }}>Smooth curves — shape-preserving, no overshoot (off for straight-segment plots)</label>
       </div>
 
       <div className="section-title" style={{ marginTop: 6 }}>Note boxes</div>
@@ -581,7 +815,9 @@ function LabelsTab({ draft, mutate }) {
 }
 
 function SourceTab({ chart }) {
-  const c = chart.confidence || {};
+  // Show the confidence of the version being viewed (so a re-run's scores are visible).
+  const cur = chart.versions[chart.current_version]?.spec || {};
+  const c = cur.confidence || chart.confidence || {};
   const bar = (label, v) => {
     const val = Math.round((v ?? 0) * 100);
     const col = val >= 80 ? "#34d399" : val >= 60 ? "#fbbf24" : "#f87171";
@@ -592,7 +828,7 @@ function SourceTab({ chart }) {
       </div>
     );
   };
-  const notes = chart.versions[0].spec.notes;
+  const notes = cur.notes ?? chart.versions[0].spec.notes;
   return (
     <>
       <div className="section-title" style={{ marginTop: 0 }}>Extraction confidence</div>

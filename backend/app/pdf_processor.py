@@ -47,6 +47,7 @@ def crop_chart(page_png: Path, bbox: list[float], out_path: Path) -> dict:
     """
     img = Image.open(page_png).convert("RGB")
     w, h = img.size
+    box = (0, 0, w, h)
     try:
         x0, y0, x1, y1 = bbox
         # clamp + sanity
@@ -64,6 +65,10 @@ def crop_chart(page_png: Path, bbox: list[float], out_path: Path) -> dict:
         crop = img.crop(box)
     except Exception:
         crop = img
+        box = (0, 0, w, h)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     crop.save(str(out_path))
-    return {"filename": out_path.name, "width": crop.width, "height": crop.height}
+    # box_norm: the crop rectangle actually used, normalized to the page image, so
+    # page-frame coordinates (e.g. plot_bbox) can be mapped into the crop's frame.
+    box_norm = [box[0] / w, box[1] / h, box[2] / w, box[3] / h]
+    return {"filename": out_path.name, "width": crop.width, "height": crop.height, "box_norm": box_norm}
