@@ -89,6 +89,21 @@ export default function ChartEditor({ docId, chart }) {
   }, [stageW, cropAspect, view]);
 
   // `height` lets the renderer size strokes/text from the crop's measured proportions.
+  // Keep the ECharts canvases in step with the pane size. echarts-for-react swallows the
+  // FIRST container resize after mount (to protect the intro animation), so when the
+  // pane settles in one step — cached crop image, so aspect + width land together — the
+  // canvas would stay at its initial (placeholder) size. Resize explicitly instead.
+  const overlayRef = useRef(null);
+  useEffect(() => {
+    const id = requestAnimationFrame(() => {
+      for (const ref of [chartRef, overlayRef]) {
+        const inst = ref.current?.getEchartsInstance?.();
+        if (inst && !inst.isDisposed?.()) inst.resize();
+      }
+    });
+    return () => cancelAnimationFrame(id);
+  }, [paneW, paneH, view, stacked]);
+
   const option = useMemo(
     () => specToOption(draft, { theme, showGrid, scale, width: paneW, height: paneH }),
     [draft, theme, showGrid, scale, paneW, paneH]
@@ -385,7 +400,7 @@ export default function ChartEditor({ docId, chart }) {
                 <img className="cmp-layer" src={assetUrl(docId, chart.crop_image)} alt="original chart" />
                 {view === "overlay" && (
                   <div className="cmp-layer" style={{ opacity, pointerEvents: "none" }}>
-                    <ReactECharts option={overlayOpt} style={{ width: "100%", height: "100%" }} notMerge lazyUpdate />
+                    <ReactECharts ref={overlayRef} option={overlayOpt} style={{ width: "100%", height: "100%" }} notMerge lazyUpdate />
                   </div>
                 )}
               </div>
