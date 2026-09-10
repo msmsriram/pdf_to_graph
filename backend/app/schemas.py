@@ -77,6 +77,10 @@ class ExtractedChart(BaseModel):
     """A single chart the model found on a page."""
     title: Optional[str] = None
     subtitle: Optional[str] = None
+    title_position: Literal["above", "below", "none"] = Field(
+        "above",
+        description="Where the title is PRINTED: 'above' the plot, 'below' it as a caption (common in European datasheets), or 'none' if no title is printed (still give a sensible title).",
+    )
     chart_type: ChartType = "line"
     stacked: bool = False
     x_axis: Axis = Field(default_factory=Axis)
@@ -97,6 +101,14 @@ class ExtractedChart(BaseModel):
     # our curves precisely on the original crop.
     plot_bbox: list[float] = Field(default_factory=lambda: [0.0, 0.0, 1.0, 1.0])
     confidence: Confidence = Field(default_factory=Confidence)
+
+
+class GateResult(BaseModel):
+    """Cheap-model verdict on whether a page contains any data chart."""
+    has_charts: bool = Field(..., description="True if the page contains at least one data chart/graph/plot.")
+    chart_count: int = Field(0, description="How many distinct charts are on the page.")
+    confidence: float = Field(..., description="0..1 confidence in has_charts.")
+    reason: str = Field("", description="One short sentence.")
 
 
 class PageExtraction(BaseModel):
@@ -120,6 +132,7 @@ class ChartSpec(BaseModel):
     """
     title: Optional[str] = None
     subtitle: Optional[str] = None
+    title_position: Literal["above", "below", "none"] = "above"
     chart_type: ChartType = "line"
     stacked: bool = False
     x_axis: Axis = Field(default_factory=Axis)

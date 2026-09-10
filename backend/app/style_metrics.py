@@ -29,6 +29,8 @@ from PIL import Image
 
 CAP_HEIGHT_RATIO = 0.72  # digit/cap height as a fraction of font size (Arial-like)
 AA_ALLOWANCE = 0.5  # anti-aliasing adds roughly half a pixel of "ink" at our threshold
+# Bump when the method changes: stored metrics with an older version are re-measured on open.
+METRICS_VERSION = 3
 
 
 # ----------------------------------------------------------------------------- basics
@@ -121,8 +123,29 @@ def _curve_pixels(spec: dict, rect_px: tuple[int, int, int, int]) -> list[list[t
     return out
 
 
-def _stroke_along(ink: np.ndarray, poly: list[tuple[float, float]], radius: int = 14) -> Optional[float]:
-    """Median ink run-length perpendicular to the curve, sampled every ~4 px along it."""
+def _min_dist_to_polyline(x: float, y: float, poly: np.ndarray) -> float:
+    """Distance from a point to a polyline given as an (n, 2) array."""
+    if len(poly) == 1:
+        return float(math.hypot(x - poly[0, 0], y - poly[0, 1]))
+    a, b = poly[:-1], poly[1:]
+    ab = b - a
+    ap = np.array([x, y]) - a
+    t = np.clip((ap * ab).sum(1) / np.maximum((ab * ab).sum(1), 1e-9), 0.0, 1.0)
+    proj = a + ab * t[:, None]
+    return float(np.sqrt(((proj - np.array([x, y])) ** 2).sum(1)).min())
+
+
+def _stroke_along(
+    ink: np.ndarray,
+    poly: list[tuple[float, float]],
+    others: list[np.ndarray],
+    min_run_steps: int = 2,
+    radius: int = 14,
+    isolation_px: float = 6.0,
+) -> Optional[float]:
+    """Trimmed-mean ink run-length perpendicular to the curve, sampled every ~4 px along it,
+    using only samples where no OTHER curve passes within `isolation_px` (a bundle of
+    touching curves would otherwise measure as one wide stroke)."""
     H, W = ink.shape
     steps = np.arange(-radius, radius + 0.5, 0.5)
     centre = int(np.argmin(np.abs(steps)))
@@ -137,6 +160,9 @@ def _stroke_along(ink: np.ndarray, poly: list[tuple[float, float]], radius: int 
         n = max(2, int(dist / 4))
         for i in range(n):
             cx, cy = ax_ + dx * i / n, ay + dy * i / n
+            # crowded by another series? then this sample can't tell us the stroke width
+            if others and min(_min_dist_to_polyline(cx, cy, o) for o in others) < isolation_px:
+                continue
             xi = np.rint(cx + steps * nx).astype(int)
             yi = np.rint(cy + steps * ny).astype(int)
             ok = (xi >= 0) & (xi < W) & (yi >= 0) & (yi < H)
@@ -144,18 +170,23 @@ def _stroke_along(ink: np.ndarray, poly: list[tuple[float, float]], radius: int 
                 continue
             prof = ink[yi, xi]
             tries += 1
-            # The WIDEST ink run within ±8 px of where the curve should be. The mapping can
-            # be a few px off (model plot-rect, sampling), and the nearest run is then often
-            # a thin gridline — gridlines are always thinner than curves, so prefer width.
             d = np.diff(np.concatenate(([0], prof.astype(np.int8), [0])))
             starts, ends = np.flatnonzero(d == 1), np.flatnonzero(d == -1)
+            # The run CONTAINING the expected position wins; otherwise the nearest run within
+            # ±8 px that is thicker than a gridline (the mapping can be a few px off).
             best = None
             for s, e in zip(starts, ends):
-                gap = 0 if s <= centre < e else min(abs(s - centre), abs(e - 1 - centre))
-                if gap > 16:  # 8 px
-                    continue
-                if best is None or (e - s) > (best[1] - best[0]):
+                if s <= centre < e:
                     best = (s, e)
+                    break
+            if best is None:
+                cands = []
+                for s, e in zip(starts, ends):
+                    gap = min(abs(s - centre), abs(e - 1 - centre))
+                    if gap <= 16 and (e - s) >= min_run_steps:
+                        cands.append((gap, (s, e)))
+                if cands:
+                    best = min(cands)[1]
             if best is None:
                 continue
             widths.append((best[1] - best[0]) * 0.5)
@@ -190,20 +221,13 @@ def measure(crop_path: Path, plot_rect: Optional[list[float]] = None, spec: Opti
     if x1 - x0 < 30 or y1 - y0 < 30:
         return None
 
-    # ---- per-series stroke, guided by the extracted curves ----
-    series_w: list[Optional[float]] = []
-    if spec:
-        for poly in _curve_pixels(spec, (x0, y0, x1, y1)):
-            w = _stroke_along(ink, poly) if len(poly) >= 2 else None
-            series_w.append(None if w is None else max(1.0, w - AA_ALLOWANCE))
-    good = [w for w in series_w if w is not None]
-    curve_w: Optional[float] = float(np.median(good)) if good else None
-    stroke_source = "curves" if good else "fallback"
-
-    # ---- global fallback + grid width from the plot interior ----
+    # ---- grid width (and global fallback material) from the plot interior ----
     ix, iy = max(2, int(0.02 * (x1 - x0))), max(2, int(0.02 * (y1 - y0)))
     sub = ink[y0 + iy : y1 - iy, x0 + ix : x1 - ix]
     grid_w: Optional[float] = None
+    grid_gray: Optional[float] = None  # 0 = black gridlines … 1 = white (how dark the original prints them)
+    rest = None
+    width = None
     if sub.shape[0] > 20 and sub.shape[1] > 20 and sub.any():
         ph, pw = sub.shape
         hr, vr = _runs(sub, 1), _runs(sub, 0)
@@ -215,11 +239,35 @@ def measure(crop_path: Path, plot_rect: Optional[list[float]] = None, spec: Opti
                 thresh = 0.2 * counts[1:].max()
                 cands = [i for i in range(1, counts.size) if counts[i] >= thresh]
                 if cands:
-                    grid_w = max(0.5, cands[0] - AA_ALLOWANCE)
-        if curve_w is None:
-            rest = sub & ~full_line & (width >= 1)
-            if rest.any():
-                curve_w = max(1.0, float(np.median(width[rest])) - AA_ALLOWANCE)
+                    # no anti-aliasing allowance here: a 1-px hairline must stay 1 px, not 0.5
+                    grid_w = max(0.75, float(cands[0]))
+            sub_rgb = rgb[y0 + iy : y1 - iy, x0 + ix : x1 - ix].astype(np.int32)
+            lum = (sub_rgb[..., 0] * 299 + sub_rgb[..., 1] * 587 + sub_rgb[..., 2] * 114) // 1000
+            grid_gray = round(float(np.median(lum[full_line])) / 255.0, 3)
+        rest = sub & ~full_line & (width >= 1)
+
+    # ---- per-series stroke, guided by the extracted curves ----
+    # A run must be thicker than a gridline to count as the curve when the mapping is off.
+    min_run_steps = int(round((grid_w + 0.5) * 2)) if grid_w is not None else 2
+    series_w: list[Optional[float]] = []
+    if spec:
+        polys = _curve_pixels(spec, (x0, y0, x1, y1))
+        arrs = [np.asarray(p, dtype=float) for p in polys]
+        for i, poly in enumerate(polys):
+            if len(poly) < 2:
+                series_w.append(None)
+                continue
+            others = [a for j, a in enumerate(arrs) if j != i and len(a) >= 1]
+            w = _stroke_along(ink, poly, others, min_run_steps=min_run_steps)
+            series_w.append(None if w is None else max(1.0, w - AA_ALLOWANCE))
+    good = [w for w in series_w if w is not None]
+    curve_w: Optional[float] = float(np.median(good)) if good else None
+    stroke_source = "curves" if good else "fallback"
+    # Series with no isolated stretch (fully inside a bundle) inherit the chart's typical stroke.
+    if curve_w is not None:
+        series_w = [curve_w if w is None else w for w in series_w]
+    elif rest is not None and width is not None and rest.any():
+        curve_w = max(1.0, float(np.median(width[rest])) - AA_ALLOWANCE)
     if grid_w is not None and curve_w is not None:
         grid_w = min(grid_w, curve_w)
 
@@ -243,6 +291,7 @@ def measure(crop_path: Path, plot_rect: Optional[list[float]] = None, spec: Opti
     if curve_w is None and font_px is None:
         return None
     out: dict[str, Any] = {
+        "v": METRICS_VERSION,
         "measured_from": "crop",
         "crop_px": [int(W), int(H)],
         "plot_rect_used": [round(float(v), 4) for v in rect],
@@ -257,6 +306,8 @@ def measure(crop_path: Path, plot_rect: Optional[list[float]] = None, spec: Opti
     if grid_w is not None:
         out["grid_px"] = round(grid_w, 2)
         out["grid_frac"] = round(grid_w / H, 5)
+    if grid_gray is not None:
+        out["grid_gray"] = grid_gray
     if font_px is not None:
         out["font_px"] = round(font_px, 2)
         out["font_frac"] = round(font_px / H, 5)

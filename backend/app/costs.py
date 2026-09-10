@@ -4,11 +4,16 @@ Cost is computed from the API's own `usage` counts (authoritative) times the
 model's list price. Reasoning tokens are billed as output tokens (they are already
 included in `output_tokens`); cached input tokens are billed at the cached rate.
 
-Prices are USD per 1M tokens on the standard tier. Override for any model with the
-PRICE_INPUT_PER_M / PRICE_CACHED_INPUT_PER_M / PRICE_OUTPUT_PER_M env vars.
+Prices are USD per 1M tokens on the standard tier.
+- Per-model overrides / additions: PRICING_JSON env, e.g.
+  {"gpt-5.4-mini": {"input": 0.4, "cached_input": 0.04, "output": 1.6}}
+- PRICE_INPUT_PER_M / PRICE_CACHED_INPUT_PER_M / PRICE_OUTPUT_PER_M apply only to
+  models that are not in the table or PRICING_JSON (a generic fallback).
+Unknown models report known=False: tokens are still counted, cost shows as 0.
 """
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
@@ -18,18 +23,33 @@ PRICING: dict[str, dict[str, float]] = {
 }
 
 
+def _env_pricing() -> dict[str, dict[str, float]]:
+    raw = os.environ.get("PRICING_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return {k: v for k, v in data.items() if isinstance(v, dict)}
+    except ValueError:
+        return {}
+
+
 def pricing_for(model: str) -> dict[str, Any]:
-    base = PRICING.get(model)
-    known = base is not None
-    p = dict(base or {"input": 0.0, "cached_input": 0.0, "output": 0.0})
-    for key, env in (("input", "PRICE_INPUT_PER_M"), ("cached_input", "PRICE_CACHED_INPUT_PER_M"), ("output", "PRICE_OUTPUT_PER_M")):
-        v = os.environ.get(env)
-        if v:
-            try:
-                p[key] = float(v)
-                known = True
-            except ValueError:
-                pass
+    base = dict(PRICING.get(model) or {})
+    base.update(_env_pricing().get(model) or {})
+    known = bool(base)
+    p = {"input": 0.0, "cached_input": 0.0, "output": 0.0}
+    if known:
+        p.update({k: float(base.get(k, 0.0)) for k in p})
+    else:
+        for key, env in (("input", "PRICE_INPUT_PER_M"), ("cached_input", "PRICE_CACHED_INPUT_PER_M"), ("output", "PRICE_OUTPUT_PER_M")):
+            v = os.environ.get(env)
+            if v:
+                try:
+                    p[key] = float(v)
+                    known = True
+                except ValueError:
+                    pass
     p["known"] = known
     p["unit"] = "USD per 1M tokens"
     return p
@@ -59,6 +79,7 @@ def add_to_totals(totals: dict[str, Any], usage: dict[str, Any]) -> dict[str, An
 
 
 def ensure_usage_block(manifest: dict[str, Any], model: str) -> dict[str, Any]:
+    """Extraction-model accounting (per page + re-runs)."""
     u = manifest.get("usage")
     if not isinstance(u, dict):
         u = {}
@@ -68,3 +89,19 @@ def ensure_usage_block(manifest: dict[str, Any], model: str) -> dict[str, Any]:
     u.setdefault("totals", empty_totals())
     u.setdefault("reruns", [])
     return u
+
+
+def ensure_gate_block(manifest: dict[str, Any], model: str) -> dict[str, Any]:
+    """Gate-model accounting, kept separate so its saving is visible."""
+    u = manifest.get("usage")
+    if not isinstance(u, dict):
+        u = {}
+        manifest["usage"] = u
+    g = u.get("gate")
+    if not isinstance(g, dict):
+        g = {}
+        u["gate"] = g
+    g.setdefault("model", model)
+    g.setdefault("pricing", pricing_for(model))
+    g.setdefault("totals", empty_totals())
+    return g

@@ -9,9 +9,14 @@ export const api = {
   listDocuments: () => http.get("/documents").then((r) => r.data),
   getDocument: (id) => http.get(`/documents/${id}`).then((r) => r.data),
   deleteDocument: (id) => http.delete(`/documents/${id}`).then((r) => r.data),
-  uploadDocument: (file, onProgress) => {
+  // One upload = one document: an optional PDF plus any number of named images.
+  // `images`: [{ file, label }]. The backend turns images into pages after the PDF's.
+  uploadBundle: ({ pdf, images = [], name = "" }, onProgress) => {
     const form = new FormData();
-    form.append("file", file);
+    if (pdf) form.append("files", pdf, pdf.name);
+    images.forEach((im, i) => form.append("files", im.file, im.file.name || `image-${i + 1}.png`));
+    form.append("name", name);
+    form.append("image_labels", JSON.stringify(images.map((im) => im.label || "")));
     return http
       .post("/documents", form, {
         headers: { "Content-Type": "multipart/form-data" },
@@ -19,6 +24,8 @@ export const api = {
       })
       .then((r) => r.data);
   },
+  // "Process anyway" for a page the gate skipped; resolves with the updated document.
+  analyzePage: (docId, pageNumber) => http.post(`/documents/${docId}/pages/${pageNumber}/analyze`).then((r) => r.data),
   saveVersion: (docId, chartId, spec, label) =>
     http.post(`/documents/${docId}/charts/${chartId}/versions`, { spec, label }).then((r) => r.data),
   revert: (docId, chartId) => http.post(`/documents/${docId}/charts/${chartId}/revert`).then((r) => r.data),

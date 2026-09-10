@@ -7,8 +7,8 @@ import { specToOption } from "../lib/chartOption.js";
 
 const STEPS = [
   { key: "uploaded", label: "Uploaded" },
-  { key: "rendering", label: "Rendering pages to images" },
-  { key: "analyzing", label: "Understanding pages with the vision model" },
+  { key: "rendering", label: "Preparing pages (PDF render + images)" },
+  { key: "analyzing", label: "Screening pages, extracting charts with the vision model" },
   { key: "complete", label: "Reconstructing & ready" },
 ];
 const ORDER = ["uploaded", "rendering", "analyzing", "complete"];
@@ -71,7 +71,8 @@ export default function Processing() {
       <div className="stat-row">
         <Stat num={pagesTotal || "—"} label="Pages" />
         <Stat num={p.pages_rendered || 0} label="Rendered" cls="accent" />
-        <Stat num={analyzed} label="Analyzed" cls="accent" />
+        <Stat num={analyzed} label="Screened / read" cls="accent" />
+        <Stat num={p.pages_skipped || 0} label="Skipped (no charts)" />
         <Stat num={p.charts_detected || 0} label="Charts found" cls="ok" />
         <Stat num={liveCharts.length} label="Reconstructed" cls="ok" />
       </div>

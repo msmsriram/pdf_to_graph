@@ -23,6 +23,16 @@ class Settings(BaseSettings):
     reasoning_effort: str = "high"
     image_detail: str = "original"
 
+    # Chart gate: a cheap vision model screens each PDF page before the expensive
+    # extraction model sees it. A page is skipped only when the gate is confident there
+    # are no charts (P(charts) < gate_threshold). Fails open on any error.
+    gate_enabled: bool = True
+    gate_model: str = "gpt-5.4-mini"
+    gate_reasoning: str = "low"
+    gate_image_detail: str = "low"
+    gate_threshold: float = 0.3
+    gate_images: bool = False  # uploaded images are explicit user intent: no gate by default
+
     # Rendering
     render_dpi: int = 180
     max_pages: int = 40

@@ -7,6 +7,7 @@ Static-> /storage serves page images and chart crops.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import time
 import uuid
@@ -16,7 +17,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     __package__ = "app"
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -46,31 +47,85 @@ app.mount("/storage", StaticFiles(directory=str(settings.storage_path)), name="s
 
 @app.get("/api/health")
 async def health() -> dict:
-    return {"ok": True, "model": settings.openai_model, "has_key": bool(settings.openai_api_key)}
+    return {
+        "ok": True,
+        "model": settings.openai_model,
+        "gate_model": settings.gate_model if settings.gate_enabled else None,
+        "has_key": bool(settings.openai_api_key),
+    }
 
 
 # --------------------------------------------------------------------------- #
 # Upload + processing
 # --------------------------------------------------------------------------- #
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+
 @app.post("/api/documents")
-async def upload_document(file: UploadFile = File(...)) -> dict:
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only .pdf files are accepted.")
+async def upload_document(
+    files: list[UploadFile] = File(...),
+    name: str = Form(""),
+    image_labels: str = Form("[]"),
+) -> dict:
+    """One upload = one document: at most one PDF plus any number of PNG/JPEG images.
+    `image_labels` is a JSON list of user-given names, in the order the images appear."""
+    try:
+        labels = json.loads(image_labels or "[]")
+        labels = [str(x) for x in labels] if isinstance(labels, list) else []
+    except ValueError:
+        labels = []
+
+    pdfs = [f for f in files if (f.filename or "").lower().endswith(".pdf")]
+    images = [f for f in files if (f.filename or "").lower().endswith(IMAGE_EXTS)]
+    if not pdfs and not images:
+        raise HTTPException(status_code=400, detail="Upload a PDF and/or PNG/JPEG images.")
+    if len(pdfs) > 1:
+        raise HTTPException(status_code=400, detail="One PDF per upload (images can be added alongside it).")
+    if len(pdfs) + len(images) != len(files):
+        raise HTTPException(status_code=400, detail="Unsupported file type: only .pdf, .png, .jpg/.jpeg and .webp are accepted.")
 
     document_id = uuid.uuid4().hex[:12]
     d = storage.doc_dir(document_id)
-    data = await file.read()
-    (d / "original.pdf").write_bytes(data)
+    sources: list[dict] = []
 
-    name = file.filename.rsplit(".", 1)[0]
-    storage.create_manifest(document_id, name=name, original_filename=file.filename)
+    if pdfs:
+        (d / "original.pdf").write_bytes(await pdfs[0].read())
+        sources.append({"kind": "pdf", "filename": pdfs[0].filename})
+
+    (d / "sources").mkdir(parents=True, exist_ok=True)
+    for i, img in enumerate(images):
+        ext = Path(img.filename or "image.png").suffix.lower() or ".png"
+        fn = f"img_{i + 1:03d}{ext}"
+        (d / "sources" / fn).write_bytes(await img.read())
+        label = labels[i].strip() if i < len(labels) and labels[i].strip() else Path(img.filename or fn).stem
+        sources.append({"kind": "image", "filename": fn, "label": label, "original_filename": img.filename})
+
+    doc_name = name.strip() or (Path(pdfs[0].filename).stem if pdfs else sources[0]["label"])
+    original_filename = pdfs[0].filename if pdfs else (images[0].filename or "images")
+    storage.create_manifest(document_id, name=doc_name, original_filename=original_filename, sources=sources)
 
     # Kick off background processing (fire and forget; progress via WebSocket).
-    import asyncio
-
     asyncio.create_task(pipeline.process_document(document_id))
+    return {"document_id": document_id, "name": doc_name, "status": "uploaded", "sources": sources}
 
-    return {"document_id": document_id, "name": name, "status": "uploaded"}
+
+@app.post("/api/documents/{document_id}/pages/{page_number}/analyze")
+async def analyze_page_override(document_id: str, page_number: int) -> dict:
+    """'Process anyway': run the extraction model on a page the gate skipped. Returns the document."""
+    m = storage.read_manifest(document_id)
+    if not m:
+        raise HTTPException(status_code=404, detail="Document not found")
+    page = next((p for p in m.get("pages", []) if p.get("page_number") == page_number), None)
+    if not page:
+        raise HTTPException(status_code=404, detail="Page not found")
+    if page.get("status") == "analyzed" and page.get("chart_ids"):
+        raise HTTPException(status_code=400, detail="This page has already been analyzed.")
+    if m.get("status") not in {"complete", "error"}:
+        raise HTTPException(status_code=409, detail="Document is still processing.")
+    try:
+        return await pipeline.analyze_page_now(document_id, page_number)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Analysis failed: {exc}")
 
 
 # --------------------------------------------------------------------------- #
@@ -93,11 +148,17 @@ async def get_document(document_id: str) -> dict:
 
 
 def _ensure_style_metrics(m: dict, document_id: str) -> bool:
-    """Stamp `style_metrics` (derived from the crop image) on every version lacking it."""
+    """Stamp `style_metrics` (derived from the crop image) on every version lacking it,
+    or carrying a measurement from an older method (version mismatch)."""
     changed = False
+
+    def stale(spec: dict) -> bool:
+        sm = spec.get("style_metrics")
+        return not sm or sm.get("v") != style_metrics.METRICS_VERSION
+
     for chart in m.get("charts", []):
         versions = chart.get("versions", [])
-        if all(v.get("spec", {}).get("style_metrics") for v in versions):
+        if not any(stale(v.get("spec", {})) for v in versions):
             continue
         crop = storage.doc_dir(document_id) / chart["crop_image"]
         if not crop.exists():
@@ -107,7 +168,7 @@ def _ensure_style_metrics(m: dict, document_id: str) -> bool:
         if not metrics:
             continue
         for v in versions:
-            if not v.get("spec", {}).get("style_metrics"):
+            if stale(v.get("spec", {})):
                 v["spec"]["style_metrics"] = metrics
                 changed = True
     return changed

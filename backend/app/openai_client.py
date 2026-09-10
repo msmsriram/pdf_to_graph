@@ -69,6 +69,10 @@ Your job:
    - A single page may contain zero, one, or many charts (dashboards are common).
 3. For each chart, extract structured, editable data:
    - title/subtitle, chart_type, whether it is stacked.
+     title_position: where the title is PRINTED — 'above' the plot, 'below' it as a caption
+     (typical for European datasheets, e.g. an English line and a German line under the x-axis),
+     or 'none' when nothing is printed (still give a sensible title). Never put axis names or
+     in-plot condition text (e.g. 'VDS = 10V') into the title.
    - x_axis and y_axis: label, unit, scale (linear/log), numeric min/max when visible, and the tick
      spacing: major_interval = the step between labelled ticks (0,2,4,… → 2; 0,5,10,… → 5);
      minor_interval = the step of the finer unlabelled gridlines if the plot has them, else null.

@@ -96,16 +96,16 @@ export const useStore = create((set, get) => ({
       case "chart_extracted":
         set({ liveCharts: [...s.liveCharts.filter((c) => c.chart_id !== ev.chart.chart_id), ev.chart] });
         break;
-      case "usage":
-        set({
-          usageLive: {
-            model: ev.model,
-            pricing: ev.pricing,
-            totals: ev.totals,
-            pages: { ...((s.usageLive && s.usageLive.pages) || {}), [ev.page_number]: ev.usage },
-          },
-        });
+      case "usage": {
+        const prev = s.usageLive || {};
+        if (ev.scope === "gate") {
+          const g = prev.gate || {};
+          set({ usageLive: { ...prev, gate: { model: ev.model, pricing: ev.pricing, totals: ev.totals, pages: { ...(g.pages || {}), [ev.page_number]: ev.usage } } } });
+        } else {
+          set({ usageLive: { ...prev, model: ev.model, pricing: ev.pricing, totals: ev.totals, pages: { ...(prev.pages || {}), [ev.page_number]: ev.usage } } });
+        }
         break;
+      }
       case "complete":
         set({ status: "complete" });
         break;

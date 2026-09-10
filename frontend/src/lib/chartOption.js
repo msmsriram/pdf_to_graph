@@ -61,15 +61,62 @@ export function specToOption(
   const marginT = rect ? rect[1] * height : 0;
   const marginR = rect ? (1 - rect[2]) * width : 0;
   const marginB = rect ? (1 - rect[3]) * height : 0;
-  // ECharts places the axis title's CENTRE at nameGap from the axis line, so leave room
+  // ---- Text placement: never put text where there is no room for it. ----
+  // Title: where the original prints it ('above' | 'below' caption | 'none'); a title that
+  // doesn't fit the top margin moves below the plot.
+  const titlePos = spec.title_position === "below" || spec.title_position === "none" ? spec.title_position : "above";
+  const hasTitle = !overlay && !!spec.title && titlePos !== "none";
+  const topBlock = hasTitle ? px(15) * 1.35 + (spec.subtitle ? px(11) * 1.45 : 0) + px(4) : 0;
+  const titleBelow = hasTitle && (titlePos === "below" || (rect && marginT < topBlock));
+  // Caption mode: datasheets set a caption in the tick-label size; shrink it further when the
+  // bottom margin can't hold the tick-label row plus the caption.
+  let capTitle = px(12.5);
+  let capSub = px(11);
+  let captionBlock = titleBelow ? capTitle * 1.25 + (spec.subtitle ? capSub * 1.3 : 0) + px(3) : 0;
+  if (titleBelow && rect) {
+    const room = marginB - px(22); // keep the tick-label row
+    if (room > 0 && captionBlock > room) {
+      const f = Math.max(0.6, room / captionBlock);
+      capTitle *= f;
+      capSub *= f;
+      captionBlock = room;
+    }
+  }
+  const titleBlock = titleBelow ? captionBlock : topBlock;
+  const titleFontPx = titleBelow ? capTitle : px(15);
+  const subFontPx = titleBelow ? capSub : px(11);
+  const bottomAvail = rect ? marginB - (titleBelow ? titleBlock : 0) : Infinity;
+  // Axis titles: 'side'/'below' (rotated left of / centred under the axis) when the margin
+  // fits tick labels + title; otherwise at the axis END — above the y-axis top if the top
+  // margin allows, else just inside the plot corner (the "[A]" / "[V]" datasheet convention).
+  const yLabelChars = Math.min(6, Math.max(2, ...[spec.y_axis?.min, spec.y_axis?.max].filter((v) => v != null).map((v) => String(v).length)));
+  const yNeed = yLabelChars * px(7.5) + px(8) + px(19);
+  const yMode = !rect ? "side" : marginL >= yNeed * 0.9 ? "side" : marginT >= px(20) ? "endAbove" : "endInside";
+  const xMode = !rect ? "below" : bottomAvail >= px(40) * 0.9 ? "below" : "endInside";
+  // ECharts places a middle axis title's CENTRE at nameGap from the axis line, so leave room
   // for half the font plus a margin: the title's outer edge ends ~px(15) from the pane edge.
   const yNameGap = rect ? Math.max(px(24), marginL - px(22)) : px(42);
-  const xNameGap = rect ? Math.max(px(18), marginB - px(22)) : px(30);
+  const xNameGap = rect ? Math.max(px(18), bottomAvail - px(22)) : px(30);
+  const yNameOpts =
+    yMode === "side"
+      ? { nameLocation: "middle", nameGap: yNameGap, nameTextStyle: {} }
+      : yMode === "endAbove"
+        ? { nameLocation: "end", nameGap: px(5), nameTextStyle: { align: "left", verticalAlign: "bottom" } }
+        : { nameLocation: "end", nameGap: -px(6), nameTextStyle: { align: "left", verticalAlign: "top", padding: [0, 0, 0, px(6)] } };
+  const xNameOpts =
+    xMode === "below"
+      ? { nameLocation: "middle", nameGap: xNameGap, nameTextStyle: {} }
+      : { nameLocation: "end", nameGap: -px(6), nameTextStyle: { align: "right", verticalAlign: "bottom", padding: [0, 0, px(5), 0] } };
 
   const axisColor = forExport ? "#444" : dark ? "#8290b0" : "#555";
-  // Major gridlines are clearly visible (datasheet-like); minor ones are lighter.
-  const gridColor = forExport ? "rgba(0,0,0,0.30)" : dark ? "rgba(255,255,255,0.18)" : "rgba(0,0,0,0.22)";
-  const minorGridColor = forExport ? "rgba(0,0,0,0.13)" : dark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.10)";
+  // Gridlines: when the crop was measured, draw them as DARK as the original prints them
+  // (grid_gray: 0 = black … 1 = white) and give minor lines the same weight — datasheets
+  // print major and minor gridlines alike. Otherwise: visible major, lighter minor.
+  const gridGray = measured && typeof sm.grid_gray === "number" ? Math.min(0.85, Math.max(0, sm.grid_gray)) : null;
+  const grayCss = gridGray != null ? `rgb(${Math.round(gridGray * 255)},${Math.round(gridGray * 255)},${Math.round(gridGray * 255)})` : null;
+  const gridColor = !dark || forExport ? grayCss || (forExport ? "rgba(0,0,0,0.30)" : "rgba(0,0,0,0.22)") : "rgba(255,255,255,0.18)";
+  const minorGridColor = !dark || forExport ? grayCss || (forExport ? "rgba(0,0,0,0.13)" : "rgba(0,0,0,0.10)") : "rgba(255,255,255,0.08)";
+  const minorGridW = gridGray != null ? gridW : 1;
   const textColor = forExport ? "#222" : dark ? "#aeb9d4" : "#333";
   const titleColor = forExport ? "#111" : dark ? "#eef2fb" : "#111";
   const series = spec.series || [];
@@ -77,17 +124,29 @@ export function specToOption(
   // Subscript fragment style used wherever text may contain X_Y.
   const richFor = (color, base) => ({
     sub: { color, fontFamily: FONT, fontSize: px(base * 0.72), verticalAlign: "bottom", padding: [px(base * 0.45), 0, 0, 0] },
+    sup: { color, fontFamily: FONT, fontSize: px(base * 0.65), verticalAlign: "top", padding: [0, 0, px(base * 0.45), 0] },
   });
+  // Log-axis tick labels as powers of ten (10{sup|-3}) — narrower than "0.001", the
+  // datasheet convention when the axis margin is tight. Non-powers stay as numbers.
+  const logExpFmt = (v) => {
+    const n = Number(v);
+    if (!(n > 0)) return String(v);
+    const e = Math.log10(n);
+    if (Math.abs(e - Math.round(e)) > 1e-9) return String(v);
+    const k10 = Math.round(e);
+    return k10 === 0 ? "1" : k10 === 1 ? "10" : `10{sup|${k10}}`;
+  };
 
   const base = {
     backgroundColor: overlay ? "transparent" : forExport ? "#ffffff" : "transparent",
     textStyle: { color: textColor, fontFamily: FONT },
     title: {
-      text: overlay ? "" : richify(spec.title || ""),
-      subtext: overlay ? "" : richify(spec.subtitle || ""),
+      text: overlay || titlePos === "none" ? "" : richify(spec.title || ""),
+      subtext: overlay || titlePos === "none" ? "" : richify(spec.subtitle || ""),
       left: "center",
-      textStyle: { color: titleColor, fontSize: px(15), fontWeight: 500, fontFamily: FONT, rich: richFor(titleColor, 15) },
-      subtextStyle: { color: axisColor, fontSize: px(11), fontFamily: FONT, rich: richFor(axisColor, 11) },
+      itemGap: titleBelow ? px(1) : px(6),
+      textStyle: { color: titleColor, fontSize: titleFontPx, fontWeight: titleBelow ? 400 : 500, fontFamily: FONT, rich: richFor(titleColor, titleFontPx / k) },
+      subtextStyle: { color: titleBelow ? textColor : axisColor, fontSize: subFontPx, fontFamily: FONT, rich: richFor(axisColor, subFontPx / k) },
     },
     tooltip: overlay ? { show: false } : { trigger: spec.chart_type === "pie" ? "item" : "axis", confine: true },
     // Legend lists only the real series (helper series like the log-paper grid are excluded).
@@ -119,14 +178,22 @@ export function specToOption(
       borderWidth: gridW,
     };
     if (overlay) base.animationDuration = 0;
-    // title vertically centred in the top margin
-    if (!overlay && spec.title) base.title.top = Math.max(0, marginT / 2 - px(10));
+    // title: centred in the top margin, or under the plot when it's a caption / doesn't fit
+    if (!overlay && spec.title && titlePos !== "none") {
+      if (titleBelow) {
+        base.title.top = undefined;
+        base.title.bottom = px(2);
+      } else {
+        base.title.top = Math.max(0, marginT / 2 - px(10));
+      }
+    }
   }
 
   // In-plot note boxes (rendered as extra `title` elements — NOT the `graphic`
   // component, which is reserved for the drag handles, so the two never collide).
   // Anchored just inside the plot-area corner; several notes sharing a corner stack.
-  const stack = { "top-left": 0, "top-right": 0, "bottom-left": 0, "bottom-right": 0 };
+  // (An in-plot y-axis title occupies the top-left corner first.)
+  const stack = { "top-left": yMode === "endInside" && spec.y_axis?.label ? px(20) : 0, "top-right": 0, "bottom-left": 0, "bottom-right": 0 };
   const annTitles = overlay
     ? []
     : (spec.annotations || [])
@@ -190,44 +257,50 @@ export function specToOption(
       type: "category",
       data: cats,
       name: axisName(spec.x_axis),
-      nameLocation: "middle",
-      nameGap: xNameGap,
+      nameLocation: xNameOpts.nameLocation,
+      nameGap: xNameOpts.nameGap,
       axisLine: { lineStyle: { color: axisColor, width: gridW } },
       axisLabel: { color: axisColor, fontSize: px(13), fontFamily: FONT },
       splitLine: { show: showGrid, lineStyle: { color: gridColor, width: gridW } },
-      nameTextStyle: { color: textColor, fontSize: px(13), fontFamily: FONT, rich: richFor(textColor, 13) },
+      nameTextStyle: { color: textColor, fontSize: px(13), fontFamily: FONT, rich: richFor(textColor, 13), ...xNameOpts.nameTextStyle },
       ...hiddenAxisBits,
     };
   } else {
     xAxis = {
       type: spec.x_axis?.scale === "log" ? "log" : "value",
       name: axisName(spec.x_axis),
-      nameLocation: "middle",
-      nameGap: xNameGap,
+      nameLocation: xNameOpts.nameLocation,
+      nameGap: xNameOpts.nameGap,
       min: spec.x_axis?.min ?? undefined,
       max: spec.x_axis?.max ?? undefined,
       inverse: spec.x_axis?.inverse === true, // values decrease to the right
       axisLine: { lineStyle: { color: axisColor, width: gridW } },
       axisLabel: { color: axisColor, fontSize: px(13), fontFamily: FONT },
       splitLine: { show: showGrid, lineStyle: { color: gridColor, width: gridW } },
-      nameTextStyle: { color: textColor, fontSize: px(13), fontFamily: FONT, rich: richFor(textColor, 13) },
-      ...linearTicks(spec.x_axis, showGrid, minorGridColor),
+      nameTextStyle: { color: textColor, fontSize: px(13), fontFamily: FONT, rich: richFor(textColor, 13), ...xNameOpts.nameTextStyle },
+      ...linearTicks(spec.x_axis, showGrid, minorGridColor, minorGridW),
       ...hiddenAxisBits,
     };
   }
   yAxis = {
     type: spec.y_axis?.scale === "log" ? "log" : "value",
     name: axisName(spec.y_axis),
-    nameLocation: "middle",
-    nameGap: yNameGap,
+    nameLocation: yNameOpts.nameLocation,
+    nameGap: yNameOpts.nameGap,
     min: spec.y_axis?.min ?? undefined,
     max: spec.y_axis?.max ?? undefined,
     inverse: spec.y_axis?.inverse === true, // values decrease going up (e.g. 0 at bottom, -1 at top)
     axisLine: { lineStyle: { color: axisColor, width: gridW } },
-    axisLabel: { color: axisColor, fontSize: px(13), fontFamily: FONT },
+    axisLabel: {
+      color: axisColor,
+      fontSize: px(13),
+      fontFamily: FONT,
+      rich: richFor(axisColor, 13),
+      formatter: spec.y_axis?.scale === "log" && yMode !== "side" ? logExpFmt : undefined,
+    },
     splitLine: { show: showGrid, lineStyle: { color: gridColor, width: gridW } },
-    nameTextStyle: { color: textColor, fontSize: px(13), fontFamily: FONT, rich: richFor(textColor, 13) },
-    ...linearTicks(spec.y_axis, showGrid, minorGridColor),
+    nameTextStyle: { color: textColor, fontSize: px(13), fontFamily: FONT, rich: richFor(textColor, 13), ...yNameOpts.nameTextStyle },
+    ...linearTicks(spec.y_axis, showGrid, minorGridColor, minorGridW),
     ...hiddenAxisBits,
   };
 
@@ -347,40 +420,42 @@ export function specToOption(
   }
 
   // Give the end-labels room so they aren't clipped at the right edge.
-  if (inlineLabels) base.grid.right = px(82);
+  if (inlineLabels && !rect) base.grid.right = px(82); // (a measured plot rect already fixes the geometry)
 
   // ---- Log-paper minor gridlines (2,3,…,9 in every decade) ----
   // Real datasheet log axes show these lines; ECharts' built-in log minor ticks are
   // evenly spaced in log-space (1.29, 1.67, …) which is NOT the classic pattern, so we
-  // draw the exact 2–9 lines ourselves via a silent markLine helper series. It is
-  // appended AFTER the real series so index-based data merges (drag) stay aligned.
-  const markData = [];
-  if (showGrid && !overlay) {
-    if (!categorical && spec.x_axis?.scale === "log") {
-      logPaperLines(axisExtent(spec.x_axis, series, (p) => p.x)).forEach((v) => markData.push({ xAxis: v }));
+  // draw the exact 2–9 lines ourselves. They are plain series DATA (one silent line
+  // series with null breaks), not markLines: markLine positions on a log axis snap to
+  // the decade below 0.01 (0.002…0.009 all landed on the 0.01 line). Series data maps
+  // through the axis exactly like the curves do. Appended AFTER the real series so
+  // index-based data merges (drag) stay aligned.
+  const gridSegs = [];
+  if (showGrid && !overlay && !categorical) {
+    const xr = axisRange(spec.x_axis, series, (p) => p.x);
+    const yr = axisRange(spec.y_axis, series, (p) => p.y);
+    if (spec.x_axis?.scale === "log" && yr) {
+      logPaperLines(axisExtent(spec.x_axis, series, (p) => p.x)).forEach((v) => gridSegs.push([v, yr[0]], [v, yr[1]], null));
     }
-    if (spec.y_axis?.scale === "log") {
-      logPaperLines(axisExtent(spec.y_axis, series, (p) => p.y)).forEach((v) => markData.push({ yAxis: v }));
+    if (spec.y_axis?.scale === "log" && xr) {
+      logPaperLines(axisExtent(spec.y_axis, series, (p) => p.y)).forEach((v) => gridSegs.push([xr[0], v], [xr[1], v], null));
     }
   }
-  if (markData.length) {
+  if (gridSegs.length) {
     echSeries.push({
       name: "__grid__",
       type: "line",
-      data: [],
+      data: gridSegs,
       silent: true,
       showSymbol: false,
+      symbol: "none",
+      connectNulls: false,
       legendHoverLink: false,
       tooltip: { show: false },
-      markLine: {
-        silent: true,
-        symbol: ["none", "none"],
-        label: { show: false },
-        animation: false,
-        z: 1, // under the curves (series z=2), above the plot background
-        lineStyle: { color: minorGridColor, width: 1, type: "solid" },
-        data: markData,
-      },
+      emphasis: { disabled: true },
+      animation: false,
+      z: 1, // under the curves (series z=2), above the plot background
+      lineStyle: { color: minorGridColor, width: minorGridW, type: "solid" },
     });
   }
 
@@ -467,7 +542,7 @@ export function pchipDensify(points, { logX = false, logY = false, per = 12 } = 
 
 // Pin a LINEAR axis to the tick spacing read off the original (major step and, if the
 // plot has finer gridlines, the minor step). Log axes are handled by logPaperLines.
-function linearTicks(axis, showGrid, minorColor) {
+function linearTicks(axis, showGrid, minorColor, minorWidth = 1) {
   if (!axis || axis.scale === "log") return {};
   const out = {};
   const major = axis.major_interval;
@@ -476,7 +551,7 @@ function linearTicks(axis, showGrid, minorColor) {
   if (major > 0 && minor > 0 && minor < major) {
     const n = Math.max(2, Math.round(major / minor));
     out.minorTick = { show: true, splitNumber: n };
-    out.minorSplitLine = { show: showGrid, lineStyle: { color: minorColor } };
+    out.minorSplitLine = { show: showGrid, lineStyle: { color: minorColor, width: minorWidth } };
   }
   return out;
 }
@@ -502,6 +577,26 @@ function axisExtent(axis, series, getter) {
     if (hi <= lo) hi = lo * 10;
   }
   return [lo, hi];
+}
+
+// [min, max] of any numeric axis: the spec's range when given, else the data's (log axes
+// expanded to whole decades). Used to span the log-paper lines across the plot.
+function axisRange(axis, series, getter) {
+  if (axis?.scale === "log") return axisExtent(axis, series, getter);
+  let lo = axis?.min, hi = axis?.max;
+  if (Number.isFinite(lo) && Number.isFinite(hi) && hi > lo) return [lo, hi];
+  let dlo = Infinity, dhi = -Infinity;
+  series.forEach((se) =>
+    (se.points || []).forEach((p) => {
+      const v = getter(p);
+      if (v != null && Number.isFinite(v)) {
+        dlo = Math.min(dlo, v);
+        dhi = Math.max(dhi, v);
+      }
+    })
+  );
+  if (!Number.isFinite(dlo) || dhi <= dlo) return null;
+  return [Number.isFinite(lo) ? lo : dlo, Number.isFinite(hi) ? hi : dhi];
 }
 
 // Values 2·10^k … 9·10^k strictly inside (min, max) — the classic log-paper lines.

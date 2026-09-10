@@ -63,11 +63,17 @@ def write_manifest(manifest: dict[str, Any]) -> None:
     _upsert_index(manifest)
 
 
-def create_manifest(document_id: str, name: str, original_filename: str) -> dict[str, Any]:
+def create_manifest(
+    document_id: str, name: str, original_filename: str, sources: Optional[list[dict[str, Any]]] = None
+) -> dict[str, Any]:
+    """`sources`: what was uploaded — [{kind: "pdf", filename}, {kind: "image", filename, label}, …].
+    A document is one PDF (optional) plus any number of named images; images become
+    pages after the PDF's pages."""
     manifest: dict[str, Any] = {
         "document_id": document_id,
         "name": name,
         "original_filename": original_filename,
+        "sources": sources or [],
         "status": "uploaded",
         "status_message": "Uploaded, waiting to process",
         "created_at": _now(),
@@ -80,6 +86,7 @@ def create_manifest(document_id: str, name: str, original_filename: str) -> dict
             "pages_total": 0,
             "pages_rendered": 0,
             "pages_analyzed": 0,
+            "pages_skipped": 0,
             "charts_detected": 0,
             "charts_extracted": 0,
         },
@@ -127,6 +134,10 @@ def _upsert_index(manifest: dict[str, Any]) -> None:
         "updated_at": manifest["updated_at"],
         "page_count": manifest.get("page_count", 0),
         "charts_count": manifest.get("charts_count", 0),
+        "pages_skipped": (manifest.get("progress") or {}).get("pages_skipped", 0),
+        "sources": [
+            {"kind": s.get("kind"), "label": s.get("label") or s.get("filename")} for s in (manifest.get("sources") or [])
+        ],
     }
     with _lock:
         idx = read_index()
