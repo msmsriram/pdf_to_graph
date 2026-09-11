@@ -141,8 +141,11 @@ async def get_document(document_id: str) -> dict:
     m = storage.read_manifest(document_id)
     if not m:
         raise HTTPException(status_code=404, detail="Document not found")
-    # Charts extracted before stroke/text measurement existed get measured on first open.
-    if await asyncio.to_thread(_ensure_style_metrics, m, document_id):
+    # Charts extracted before stroke/text measurement existed get measured on first open;
+    # usage recorded while a model had no price gets its cost filled in once one exists.
+    changed = await asyncio.to_thread(_ensure_style_metrics, m, document_id)
+    changed = costs.refresh_pricing(m) or changed
+    if changed:
         storage.write_manifest(m)
     return m
 

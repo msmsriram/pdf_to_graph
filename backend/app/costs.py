@@ -20,6 +20,8 @@ from typing import Any
 PRICING: dict[str, dict[str, float]] = {
     "gpt-6-astra": {"input": 10.0, "cached_input": 1.0, "output": 50.0},
     "gpt-5.6-sol": {"input": 5.0, "cached_input": 0.5, "output": 30.0},
+    # gate model (OpenAI list price, standard tier)
+    "gpt-5.4-mini": {"input": 0.75, "cached_input": 0.075, "output": 4.5},
 }
 
 
@@ -89,6 +91,44 @@ def ensure_usage_block(manifest: dict[str, Any], model: str) -> dict[str, Any]:
     u.setdefault("totals", empty_totals())
     u.setdefault("reruns", [])
     return u
+
+
+def refresh_pricing(manifest: dict[str, Any]) -> bool:
+    """A document processed while a model had no price keeps cost 0 in its stored usage.
+    Once a price is known (table or PRICING_JSON), recompute that model's per-page costs
+    and totals in place. Returns True when anything changed."""
+    u = manifest.get("usage")
+    if not isinstance(u, dict):
+        return False
+    changed = False
+
+    def _recompute(block: dict[str, Any], page_key: str) -> None:
+        nonlocal changed
+        model = block.get("model")
+        if not model or (block.get("pricing") or {}).get("known"):
+            return
+        pricing = pricing_for(model)
+        if not pricing["known"]:
+            return
+        block["pricing"] = pricing
+        totals = empty_totals()
+        for p in manifest.get("pages", []):
+            usage = (p.get(page_key) or {}).get("usage") if page_key == "gate" else p.get("usage")
+            if isinstance(usage, dict) and usage.get("model") == model:
+                usage["cost_usd"] = cost_usd(usage, pricing)
+                add_to_totals(totals, usage)
+        if page_key != "gate":
+            for r in block.get("reruns", []):
+                if r.get("model") == model:
+                    r["cost_usd"] = cost_usd(r, pricing)
+                    add_to_totals(totals, r)
+        block["totals"] = totals
+        changed = True
+
+    _recompute(u, "usage")
+    if isinstance(u.get("gate"), dict):
+        _recompute(u["gate"], "gate")
+    return changed
 
 
 def ensure_gate_block(manifest: dict[str, Any], model: str) -> dict[str, Any]:

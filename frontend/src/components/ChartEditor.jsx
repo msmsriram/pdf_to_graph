@@ -11,6 +11,14 @@ const PALETTE = ["#5b8cff", "#7c5cff", "#34d399", "#fbbf24", "#f87171", "#22d3ee
 
 const TABS = ["Data", "Style", "Axes", "Series", "Labels", "Source", "History"];
 
+// 'auto' dimensions: the instance always follows its container (see the resize effect).
+const ECHARTS_OPTS = { renderer: "canvas", width: "auto", height: "auto" };
+// Fit an ECharts instance to its container. 'auto' is required: an instance created with
+// explicit dimensions ignores its container on a plain resize().
+const fitToBox = (inst) => {
+  if (inst && !inst.isDisposed?.()) inst.resize({ width: "auto", height: "auto" });
+};
+
 export default function ChartEditor({ docId, chart }) {
   const updateChart = useStore((s) => s.updateChart);
   const setDocument = useStore((s) => s.setDocument);
@@ -89,19 +97,43 @@ export default function ChartEditor({ docId, chart }) {
   }, [stageW, cropAspect, view]);
 
   // `height` lets the renderer size strokes/text from the crop's measured proportions.
-  // Keep the ECharts canvases in step with the pane size. echarts-for-react swallows the
-  // FIRST container resize after mount (to protect the intro animation), so when the
-  // pane settles in one step — cached crop image, so aspect + width land together — the
-  // canvas would stay at its initial (placeholder) size. Resize explicitly instead.
+  // Keep the ECharts canvases in step with the pane size. Two echarts-for-react traits
+  // work against us: (1) it re-creates its instance with an EXPLICIT width/height taken
+  // from the element at mount time (our placeholder size before the stage is measured),
+  // and an instance with explicit dimensions ignores its container on a plain resize();
+  // (2) it swallows the first container-resize event after mount. So the instances are
+  // created with width/height 'auto' (ECHARTS_OPTS) and we resize explicitly with 'auto'.
+  // (3) echarts-for-react first mounts a TEMPORARY instance and only re-creates the
+  // final one on its 'finished' event — a resize issued in between lands on the throwaway
+  // instance. So sizing is not tied to React's commit timing at all: a ResizeObserver on
+  // the pane boxes re-fits the canvases on EVERY container size change, and onChartReady
+  // fits the final instance the moment it exists.
   const overlayRef = useRef(null);
+  const paneRef = useRef(null);
+  const overlayPaneRef = useRef(null);
+  const fitAll = () => {
+    for (const ref of [chartRef, overlayRef]) fitToBox(ref.current?.getEchartsInstance?.());
+  };
   useEffect(() => {
-    const id = requestAnimationFrame(() => {
-      for (const ref of [chartRef, overlayRef]) {
-        const inst = ref.current?.getEchartsInstance?.();
-        if (inst && !inst.isDisposed?.()) inst.resize();
-      }
-    });
-    return () => cancelAnimationFrame(id);
+    const els = [paneRef.current, overlayPaneRef.current].filter(Boolean);
+    if (!els.length) return undefined;
+    const ro = new ResizeObserver(() => fitAll());
+    els.forEach((el) => ro.observe(el));
+    return () => ro.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, stacked]);
+  useEffect(() => {
+    // next frame, plus timer fallbacks: frames are throttled or absent in background /
+    // occluded tabs, and the library's final instance may appear a beat later.
+    const id = requestAnimationFrame(fitAll);
+    const t1 = setTimeout(fitAll, 80);
+    const t2 = setTimeout(fitAll, 400);
+    return () => {
+      cancelAnimationFrame(id);
+      clearTimeout(t1);
+      clearTimeout(t2);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paneW, paneH, view, stacked]);
 
   const option = useMemo(
@@ -396,11 +428,11 @@ export default function ChartEditor({ docId, chart }) {
                 <span>Original (PDF)</span>
                 {view === "overlay" && <span>+ our curves at {Math.round(opacity * 100)}%</span>}
               </div>
-              <div className="pane-box" style={{ height: paneH }}>
+              <div className="pane-box" ref={overlayPaneRef} style={{ height: paneH }}>
                 <img className="cmp-layer" src={assetUrl(docId, chart.crop_image)} alt="original chart" />
                 {view === "overlay" && (
                   <div className="cmp-layer" style={{ opacity, pointerEvents: "none" }}>
-                    <ReactECharts ref={overlayRef} option={overlayOpt} style={{ width: "100%", height: "100%" }} notMerge lazyUpdate />
+                    <ReactECharts ref={overlayRef} option={overlayOpt} style={{ width: "100%", height: "100%" }} notMerge lazyUpdate opts={ECHARTS_OPTS} onChartReady={fitToBox} />
                   </div>
                 )}
               </div>
@@ -412,14 +444,15 @@ export default function ChartEditor({ docId, chart }) {
                 <span>Reconstructed · editable</span>
                 {interactive && draft.chart_type !== "pie" && <span>drag points · double-click adds</span>}
               </div>
-              <div className="pane-box chart-canvas" style={{ height: paneH }}>
+              <div className="pane-box chart-canvas" ref={paneRef} style={{ height: paneH }}>
                 <ReactECharts
                   ref={chartRef}
                   option={option}
                   style={{ width: "100%", height: "100%" }}
                   notMerge
                   lazyUpdate
-                  opts={{ renderer: "canvas" }}
+                  opts={ECHARTS_OPTS}
+                  onChartReady={fitToBox}
                 />
               </div>
             </div>
