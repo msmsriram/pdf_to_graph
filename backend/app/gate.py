@@ -11,11 +11,14 @@ from __future__ import annotations
 import base64
 import io
 from pathlib import Path
+from threading import Event
+from typing import Callable
 
 from PIL import Image
 
 from .config import get_settings
 from .openai_client import _get_client, _usage_from
+from .jobs import ProcessingCancelled
 from .schemas import GateResult
 
 GATE_PROMPT = (
@@ -40,13 +43,17 @@ def _zero_usage(model: str, effort: str) -> dict:
     return {"model": model, "effort": effort, "input_tokens": 0, "cached_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0, "total_tokens": 0}
 
 
-def classify_page(page_png: Path) -> tuple[GateResult, dict]:
-    """Returns (verdict, usage). Never raises — fails open."""
+def classify_page(
+    page_png: Path,
+    cancel_event: Event | None = None,
+    set_stream_closer: Callable[[Callable[[], None] | None], None] | None = None,
+) -> tuple[GateResult, dict]:
+    """Return (verdict, usage); ordinary errors fail open, explicit cancellation propagates."""
     s = get_settings()
     try:
         client = _get_client()
         b64 = _small_png_b64(page_png)
-        resp = client.responses.parse(
+        with client.responses.stream(
             model=s.gate_model,
             reasoning={"effort": s.gate_reasoning},
             input=[
@@ -59,14 +66,31 @@ def classify_page(page_png: Path) -> tuple[GateResult, dict]:
                 }
             ],
             text_format=GateResult,
-        )
+        ) as stream:
+            if set_stream_closer:
+                set_stream_closer(stream.close)
+            for _event in stream:
+                if cancel_event and cancel_event.is_set():
+                    stream.close()
+                    raise ProcessingCancelled("Stopped by user")
+            resp = stream.get_final_response()
+        if set_stream_closer:
+            set_stream_closer(None)
         usage = _usage_from(resp, s.gate_model, s.gate_reasoning)
         parsed = resp.output_parsed
         if parsed is None:
             return GateResult(has_charts=True, chart_count=0, confidence=0.0, reason="Gate returned no answer; passing page through."), usage
         parsed.confidence = max(0.0, min(1.0, float(parsed.confidence)))
         return parsed, usage
+    except ProcessingCancelled:
+        if set_stream_closer:
+            set_stream_closer(None)
+        raise
     except Exception as exc:  # noqa: BLE001 — fail open
+        if set_stream_closer:
+            set_stream_closer(None)
+        if cancel_event and cancel_event.is_set():
+            raise ProcessingCancelled("Stopped by user") from exc
         return (
             GateResult(has_charts=True, chart_count=0, confidence=0.0, reason=f"Gate error ({type(exc).__name__}); passing page through."),
             _zero_usage(s.gate_model, s.gate_reasoning),

@@ -46,20 +46,32 @@ The frontend proxies `/api`, `/storage`, and `/ws` to the backend on port 8000
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/documents` | Upload a PDF, starts background processing, returns `document_id` |
+| POST | `/api/documents` | Upload one PDF and/or images, starts background processing, returns `document_id` |
+| POST | `/api/documents/{id}/pages/{n}/analyze` | Force a skipped page or retry a failed page |
 | GET | `/api/documents` | History list (home page) |
 | GET | `/api/documents/{id}` | Full document manifest (pages, charts, versions) |
 | DELETE | `/api/documents/{id}` | Delete a document |
 | POST | `/api/documents/{id}/charts/{cid}/versions` | Save an edit as a new version |
+| POST | `/api/documents/{id}/charts/{cid}/rerun` | Start a streamed, cancellable chart re-extraction job |
+| POST | `/api/documents/{id}/jobs/{job_id}/cancel` | Stop an active document or chart job |
 | POST | `/api/documents/{id}/charts/{cid}/revert` | Step back one version (undo) |
 | POST | `/api/documents/{id}/charts/{cid}/set-version/{v}` | Jump to a specific version |
 | POST | `/api/documents/{id}/charts/{cid}/finalize` | Mark current version as final |
 | GET | `/storage/{id}/...` | Static page images & chart crops |
 
-**WebSocket** — `/ws/documents/{id}` — the live processing feed only. Event types:
-`status`, `progress`, `page_rendered`, `chart_detected`, `chart_extracted`,
-`page_analyzed`, `log`, `complete`, `error`. A replay buffer means a client that
-connects late still gets every earlier event, then the live stream.
+**WebSocket** — `/ws/documents/{id}?after=<sequence>` — the live processing feed.
+It includes gate verdicts, safe Astra reasoning summaries, semantic draft-chart updates,
+validated charts, per-page failures, progress and usage. Every event has a monotonic
+`sequence`; the client reconnects from its last one. Events are journaled to disk, so a
+late or briefly disconnected client can replay what it missed. The final validated
+manifest remains authoritative over every provisional streamed value.
+
+The default processing screen is the visual “foundry” experience. Users can switch to
+the original technical pipeline/log view at any time.
+
+Document processing and chart re-extraction are tracked jobs. Their Stop controls are
+enabled only while the relevant job is active. Cancellation closes the active model
+response stream and prevents a cancelled chart re-extraction from appending a version.
 
 ---
 
@@ -71,6 +83,7 @@ backend/storage/
   <document_id>/
     original.pdf
     manifest.json                 # source of truth (pages, charts, versions)
+    events.jsonl                  # sequenced live-event replay journal
     pages/page_001.png ...
     charts/p001_c01.png ...       # cropped original chart regions
     page_001.txt ...              # human-readable XML artifact (<summary>/<charts>)
@@ -95,5 +108,7 @@ backend/storage/
 - Chart detection + data extraction are done by the model in one pass (the deterministic
   pixel-tracing digitizer is a planned Phase-2 accuracy upgrade).
 - Single-user, local, no auth. Storage is JSON files on disk.
+- Event replay survives a server restart, but in-flight background jobs do not yet resume
+  after a process restart (a durable worker queue is outside the MVP).
 - Supported chart types: line, area, bar (grouped/stacked), scatter, pie.
 ```

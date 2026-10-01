@@ -13,12 +13,17 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from pathlib import Path
+from threading import Event
+from typing import Any, Callable
 
 from openai import OpenAI
 
 from .config import get_settings
+from .jobs import ProcessingCancelled
 from .schemas import ExtractedChart, PageExtraction
+from .streaming import StructuredStreamObserver
 
 _client: OpenAI | None = None
 
@@ -176,6 +181,118 @@ def extract_page(page_png: Path, page_number: int, running_notes: str) -> tuple[
     return PageExtraction.model_validate(data), _usage_from(resp, settings.openai_model, settings.reasoning_effort)
 
 
+def extract_page_stream(
+    page_png: Path,
+    page_number: int,
+    running_notes: str,
+    on_event: Callable[[dict[str, Any]], None],
+    cancel_event: Event | None = None,
+    set_stream_closer: Callable[[Callable[[], None] | None], None] | None = None,
+) -> tuple[PageExtraction, dict]:
+    """Stream safe provisional observations, then return the validated final page.
+
+    Streaming is an enhancement rather than a new source of truth. If the SDK or
+    model rejects it, the established non-streaming path is used and the caller is
+    explicitly told that the cinematic preview has fallen back.
+    """
+    settings = get_settings()
+    client = _get_client()
+    user_text = (
+        f"Page number: {page_number}.\n"
+        f"Rolling notes from previous pages (may be empty):\n\"\"\"\n{running_notes}\n\"\"\"\n\n"
+        "Extract this page now."
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": user_text},
+                {"type": "input_image", "image_url": _encode_image(page_png), "detail": settings.image_detail},
+            ],
+        }
+    ]
+    observer = StructuredStreamObserver(page_number)
+    summary_pending = ""
+    output_started = False
+    point_buffer: dict[tuple[str, int], dict[str, Any]] = {}
+    last_point_flush = time.monotonic()
+
+    def buffer_observation(item: dict[str, Any]) -> None:
+        if item.get("type") != "points_draft_batch":
+            on_event(item)
+            return
+        key = (str(item.get("draft_id")), int(item.get("series_index") or 0))
+        pending = point_buffer.get(key)
+        if pending is None:
+            point_buffer[key] = {**item, "points": list(item.get("points") or [])}
+        else:
+            pending["points"].extend(item.get("points") or [])
+            pending["point_count"] = item.get("point_count", pending.get("point_count", 0))
+
+    def flush_points() -> None:
+        nonlocal last_point_flush
+        for pending in point_buffer.values():
+            on_event(pending)
+        point_buffer.clear()
+        last_point_flush = time.monotonic()
+
+    try:
+        if cancel_event and cancel_event.is_set():
+            raise ProcessingCancelled("Stopped by user")
+        with client.responses.stream(
+            model=settings.openai_model,
+            reasoning={"effort": settings.reasoning_effort, "summary": "auto"},
+            instructions=SYSTEM_PROMPT,
+            input=messages,
+            text_format=PageExtraction,
+        ) as stream:
+            if set_stream_closer:
+                set_stream_closer(stream.close)
+            for event in stream:
+                if cancel_event and cancel_event.is_set():
+                    stream.close()
+                    raise ProcessingCancelled("Stopped by user")
+                if event.type == "response.reasoning_summary_text.delta":
+                    summary_pending += event.delta
+                    if len(summary_pending) >= 120 or "\n" in summary_pending:
+                        on_event({"type": "reasoning_summary_delta", "delta": summary_pending})
+                        summary_pending = ""
+                elif event.type == "response.output_text.delta":
+                    if not output_started:
+                        output_started = True
+                        on_event({"type": "astra_output_started", "page_number": page_number})
+                    for item in observer.observe(event.snapshot):
+                        buffer_observation(item)
+                    # A tiny semantic buffer avoids re-rendering ECharts for every
+                    # token while keeping plotted points visibly near-real-time.
+                    if point_buffer and time.monotonic() - last_point_flush >= 0.075:
+                        flush_points()
+            if summary_pending:
+                on_event({"type": "reasoning_summary_delta", "delta": summary_pending})
+            flush_points()
+            response = stream.get_final_response()
+        if set_stream_closer:
+            set_stream_closer(None)
+        parsed = response.output_parsed
+        if parsed is None:
+            raise RuntimeError("Model returned no validated structured page output.")
+        parsed.page_number = page_number
+        return parsed, _usage_from(response, settings.openai_model, settings.reasoning_effort)
+    except ProcessingCancelled:
+        if set_stream_closer:
+            set_stream_closer(None)
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if set_stream_closer:
+            set_stream_closer(None)
+        if cancel_event is not None:
+            if cancel_event.is_set():
+                raise ProcessingCancelled("Stopped by user") from exc
+            raise
+        on_event({"type": "astra_stream_fallback", "page_number": page_number, "reason": type(exc).__name__})
+        return extract_page(page_png, page_number, running_notes)
+
+
 SINGLE_CHART_ADDENDUM = """
 
 RE-EXTRACTION MODE: the image is ONE chart cropped from a datasheet page. Extract exactly this chart
@@ -184,6 +301,100 @@ curve shapes, exact on-plot label positions, note boxes. Ignore anything above a
 or rolling notes. Set bbox to [0, 0, 1, 1] and plot_bbox to the axes rectangle (plot area only)
 within THIS image. A previous extraction is provided for reference only —
 it may contain errors; always trust the image over it."""
+
+
+def extract_single_chart_stream(
+    crop_png: Path,
+    prior_spec: dict,
+    page_number: int,
+    on_event: Callable[[dict[str, Any]], None],
+    cancel_event: Event,
+    set_stream_closer: Callable[[Callable[[], None] | None], None],
+    effort: str | None = None,
+    model: str | None = None,
+) -> tuple[ExtractedChart, dict]:
+    """Cancellable structured stream for one chart re-extraction."""
+    settings = get_settings()
+    client = _get_client()
+    use_model = model or settings.openai_model
+    use_effort = effort or settings.reasoning_effort
+    user_text = (
+        "Re-extract this single chart.\n"
+        f"Previous extraction (reference only, may be wrong):\n{json.dumps(prior_spec, ensure_ascii=False)[:6000]}"
+    )
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": user_text},
+            {"type": "input_image", "image_url": _encode_image(crop_png), "detail": settings.image_detail},
+        ],
+    }]
+    observer = StructuredStreamObserver(page_number)
+    reasoning_pending = ""
+    point_buffer: dict[tuple[str, int], dict[str, Any]] = {}
+    last_point_flush = time.monotonic()
+
+    def forward(item: dict[str, Any]) -> None:
+        if item.get("type") != "points_draft_batch":
+            on_event(item)
+            return
+        key = (str(item.get("draft_id")), int(item.get("series_index") or 0))
+        pending = point_buffer.get(key)
+        if pending is None:
+            point_buffer[key] = {**item, "points": list(item.get("points") or [])}
+        else:
+            pending["points"].extend(item.get("points") or [])
+            pending["point_count"] = item.get("point_count", pending.get("point_count", 0))
+
+    def flush_points() -> None:
+        nonlocal last_point_flush
+        for pending in point_buffer.values():
+            on_event(pending)
+        point_buffer.clear()
+        last_point_flush = time.monotonic()
+
+    try:
+        if cancel_event.is_set():
+            raise ProcessingCancelled("Stopped by user")
+        with client.responses.stream(
+            model=use_model,
+            reasoning={"effort": use_effort, "summary": "auto"},
+            instructions=SYSTEM_PROMPT + SINGLE_CHART_ADDENDUM,
+            input=messages,
+            text_format=ExtractedChart,
+        ) as stream:
+            set_stream_closer(stream.close)
+            for event in stream:
+                if cancel_event.is_set():
+                    stream.close()
+                    raise ProcessingCancelled("Stopped by user")
+                if event.type == "response.reasoning_summary_text.delta":
+                    reasoning_pending += event.delta
+                    if len(reasoning_pending) >= 120 or "\n" in reasoning_pending:
+                        on_event({"type": "reasoning_summary_delta", "delta": reasoning_pending})
+                        reasoning_pending = ""
+                elif event.type == "response.output_text.delta":
+                    for item in observer.observe(event.snapshot):
+                        forward(item)
+                    if point_buffer and time.monotonic() - last_point_flush >= 0.075:
+                        flush_points()
+            if reasoning_pending:
+                on_event({"type": "reasoning_summary_delta", "delta": reasoning_pending})
+            flush_points()
+            response = stream.get_final_response()
+        set_stream_closer(None)
+        parsed = response.output_parsed
+        if parsed is None:
+            raise RuntimeError("Model returned no validated chart output.")
+        return parsed, _usage_from(response, use_model, use_effort)
+    except ProcessingCancelled:
+        set_stream_closer(None)
+        raise
+    except Exception as exc:  # noqa: BLE001
+        set_stream_closer(None)
+        if cancel_event.is_set():
+            raise ProcessingCancelled("Stopped by user") from exc
+        raise
 
 
 def extract_single_chart(

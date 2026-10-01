@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import ReactECharts from "echarts-for-react";
 import * as echarts from "echarts";
 import { api, assetUrl } from "../lib/api.js";
+import { subscribeDocument } from "../lib/ws.js";
 import { useStore } from "../store.js";
 import { specToOption } from "../lib/chartOption.js";
 import { useDraggablePoints } from "../lib/useChartInteractions.js";
@@ -13,6 +14,15 @@ const TABS = ["Data", "Style", "Axes", "Series", "Labels", "Source", "History"];
 
 // 'auto' dimensions: the instance always follows its container (see the resize effect).
 const ECHARTS_OPTS = { renderer: "canvas", width: "auto", height: "auto" };
+const streamText = (text) => (text || "").replace(/\*\*/g, "").replace(/^#{1,6}\s+/gm, "").trim();
+const liveDraftSpec = (draft) => ({
+  title: draft?.title || "Chart emerging…", subtitle: draft?.subtitle || null,
+  title_position: draft?.title_position || "above", chart_type: draft?.chart_type || "line",
+  stacked: draft?.stacked || false, x_axis: draft?.x_axis || {}, y_axis: draft?.y_axis || {},
+  series: (draft?.series || []).filter(Boolean), legend: draft?.legend ?? true,
+  inline_labels: false, show_markers: true, smooth: draft?.smooth ?? false,
+  annotations: draft?.annotations || [], confidence: draft?.confidence || {},
+});
 // Fit an ECharts instance to its container. 'auto' is required: an instance created with
 // explicit dimensions ignores its container on a plain resize().
 const fitToBox = (inst) => {
@@ -22,6 +32,10 @@ const fitToBox = (inst) => {
 export default function ChartEditor({ docId, chart }) {
   const updateChart = useStore((s) => s.updateChart);
   const setDocument = useStore((s) => s.setDocument);
+  const handleEvent = useStore((s) => s.handleEvent);
+  const beginChartJob = useStore((s) => s.beginChartJob);
+  const chartJob = useStore((s) => s.chartJobs[chart.chart_id]);
+  const rerunDraft = useStore((s) => chartJob?.draft_id ? s.draftCharts[chartJob.draft_id] : null);
   const theme = useStore((s) => s.theme);
   const rightRailOpen = useStore((s) => s.rightRailOpen);
   const setRail = useStore((s) => s.setRail);
@@ -40,7 +54,7 @@ export default function ChartEditor({ docId, chart }) {
   const [showGrid, setShowGrid] = useState(true);
   const [printStyle, setPrintStyle] = useState(false);
   const [rerunEffort, setRerunEffort] = useState("xhigh");
-  const [rerunBusy, setRerunBusy] = useState(false);
+  const [rerunLaunching, setRerunLaunching] = useState(false);
   const [rerunError, setRerunError] = useState(null);
   // Geometry: both stage panes keep the ORIGINAL crop's aspect ratio (measured from the
   // crop image itself, so it works for every chart) and all sizes scale with width.
@@ -49,6 +63,17 @@ export default function ChartEditor({ docId, chart }) {
   const stageRef = useRef(null);
   const [view, setView] = useState("side"); // "side" | "overlay" | "only"
   const [opacity, setOpacity] = useState(0.65);
+  const rerunActive = rerunLaunching || ["running", "cancelling"].includes(chartJob?.status);
+
+  // Re-extraction is a background job. Attach after the start response and replay
+  // only this job's durable events, so even very early model chunks are not missed.
+  useEffect(() => {
+    const jobId = chartJob?.job_id;
+    if (!jobId || !["running", "cancelling"].includes(chartJob.status)) return;
+    return subscribeDocument(docId, (event) => {
+      if (event.job_id === jobId) handleEvent(event);
+    });
+  }, [docId, chartJob?.job_id, chartJob?.status, handleEvent]);
 
   useEffect(() => {
     const el = stageRef.current;
@@ -237,19 +262,32 @@ export default function ChartEditor({ docId, chart }) {
   // Re-run extraction for this chart only (higher effort). Appends a new version;
   // the editor's reset effect then loads it as the current draft.
   const rerun = async () => {
-    setRerunBusy(true);
+    setRerunLaunching(true);
     setRerunError(null);
     try {
-      const updated = await api.rerunChart(docId, chart.chart_id, { effort: rerunEffort });
-      updateChart(updated);
-      // refresh document-level usage/cost (the re-run is added to the totals)
-      api.getDocument(docId).then(setDocument).catch(() => {});
+      const job = await api.rerunChart(docId, chart.chart_id, { effort: rerunEffort });
+      beginChartJob(chart.chart_id, { ...job, effort: rerunEffort });
     } catch (e) {
       setRerunError(e?.response?.data?.detail || "Re-extraction failed");
     } finally {
-      setRerunBusy(false);
+      setRerunLaunching(false);
     }
   };
+
+  const stopRerun = async () => {
+    if (!chartJob?.job_id || !rerunActive || chartJob.status === "cancelling") return;
+    try {
+      await api.cancelJob(docId, chartJob.job_id);
+    } catch (e) {
+      setRerunError(e?.response?.data?.detail || "Could not stop re-extraction");
+    }
+  };
+
+  useEffect(() => {
+    if (chartJob?.status === "completed") {
+      api.getDocument(docId).then(setDocument).catch(() => {});
+    }
+  }, [chartJob?.status, docId, setDocument]);
 
   // ---- export ----
   // WYSIWYG by default: reproduce EXACTLY what's on screen — same chart option
@@ -314,7 +352,7 @@ export default function ChartEditor({ docId, chart }) {
   };
 
   return (
-    <div className="ws-editor">
+    <div className={`ws-editor ${rerunActive ? "rerun-active" : ""}`}>
       {/* ---- centre stage: original | reconstructed ---- */}
       <section className="stage">
         <div className="stage-head">
@@ -336,14 +374,14 @@ export default function ChartEditor({ docId, chart }) {
               style={{ width: "auto", padding: "6px 9px", fontSize: 12 }}
               value={rerunEffort}
               onChange={(e) => setRerunEffort(e.target.value)}
-              disabled={rerunBusy}
+              disabled={rerunActive}
             >
               <option value="high">effort: high</option>
               <option value="xhigh">effort: xhigh</option>
               <option value="max">effort: max</option>
             </select>
-            <button className="btn btn-sm" onClick={rerun} disabled={rerunBusy || busy}>
-              {rerunBusy ? (
+            <button className="btn btn-sm" onClick={rerun} disabled={rerunActive || busy || dirty} title={dirty ? "Save or discard your unsaved edits before re-extracting" : "Re-extract this chart"}>
+              {rerunActive ? (
                 <>
                   <span className="pipe-spin" style={{ display: "inline-block" }} /> Re-extracting…
                 </>
@@ -351,13 +389,16 @@ export default function ChartEditor({ docId, chart }) {
                 "↻ Re-extract"
               )}
             </button>
+            <button className="btn btn-sm btn-stop" onClick={stopRerun} disabled={!chartJob?.job_id || !rerunActive || chartJob?.status === "cancelling"} title={chartJob?.job_id && rerunActive ? "Stop this chart re-extraction" : "No cancellable chart job is currently running"}>
+              <span aria-hidden="true">■</span> {chartJob?.status === "cancelling" ? "Stopping…" : "Stop"}
+            </button>
           </div>
           {dirty && <span className="dirty-badge">● unsaved edits</span>}
         </div>
-        {rerunError && <div className="warn-banner">⚠ {rerunError}</div>}
+        {(rerunError || chartJob?.error) && <div className="warn-banner">⚠ {rerunError || chartJob.error}</div>}
 
         {/* view + interaction toolbar */}
-        <div className="stage-toolbar">
+        <div className="stage-toolbar" inert={rerunActive ? "" : undefined} aria-disabled={rerunActive || undefined}>
           <div className="seg" title="How to show the original and the reconstruction">
             {[
               ["side", "Side by side"],
@@ -421,7 +462,8 @@ export default function ChartEditor({ docId, chart }) {
         </div>
 
         {/* the two panes: identical size and aspect ratio (the crop's) */}
-        <div className={`stage-body ${stacked ? "stacked" : ""}`} ref={stageRef}>
+        {rerunActive && <ChartRerunLive chart={chart} draft={rerunDraft} job={chartJob} docId={docId} theme={theme} onStop={stopRerun} />}
+        <div className={`stage-body ${stacked ? "stacked" : ""} ${rerunActive ? "behind-live" : ""}`} ref={stageRef} aria-hidden={rerunActive || undefined}>
           {view !== "only" && (
             <div className="pane" style={{ width: paneW }}>
               <div className="pane-cap">
@@ -458,15 +500,15 @@ export default function ChartEditor({ docId, chart }) {
             </div>
           )}
         </div>
-        {view === "overlay" && (
+        {!rerunActive && view === "overlay" && (
           <div className="muted">Our curves drawn over the PDF crop at the same size — any offset you see is real. Edit, or re-extract.</div>
         )}
-        {!hasRect && (
+        {!rerunActive && !hasRect && (
           <div className="muted">Overlay needs the plot-area position: press ↻ Re-extract once on this chart to capture it.</div>
         )}
 
         {/* export */}
-        <div className="stage-export">
+        <div className="stage-export" inert={rerunActive ? "" : undefined} aria-disabled={rerunActive || undefined}>
           <span className="muted">Export:</span>
           <button className="btn btn-sm" onClick={() => exportImage("png")}>PNG</button>
           <button className="btn btn-sm" onClick={() => exportImage("jpeg")}>JPEG</button>
@@ -485,7 +527,7 @@ export default function ChartEditor({ docId, chart }) {
       </section>
 
       {/* ---- right rail: tabbed editor (collapses to a vertical tab strip) ---- */}
-      <aside className={`rail rail-right ${rightRailOpen ? "" : "collapsed"}`}>
+      <aside className={`rail rail-right ${rightRailOpen ? "" : "collapsed"}`} aria-disabled={rerunActive || undefined} inert={rerunActive ? "" : undefined}>
         {rightRailOpen ? (
           <>
             <div className="rail-head">
@@ -547,6 +589,40 @@ export default function ChartEditor({ docId, chart }) {
         )}
       </aside>
     </div>
+  );
+}
+
+function ChartRerunLive({ chart, draft, job, docId, theme, onStop }) {
+  const series = (draft?.series || []).filter(Boolean);
+  const points = series.reduce((total, item) => total + (item.points?.length || 0), 0);
+  const reasoning = streamText(job?.reasoning);
+  const phase = points ? "plotting" : reasoning ? "thinking" : "examining";
+  const paragraphs = (reasoning || "Astra is examining the chart crop, its axes, labels and curve geometry.")
+    .split(/\n\s*\n|\n/).filter(Boolean);
+
+  return (
+    <section className={`chart-rerun-live ${phase}`} aria-busy="true" aria-label="Live chart re-extraction">
+      <div className="rerun-liquid" aria-hidden="true" />
+      <img className="rerun-source" src={assetUrl(docId, chart.crop_image)} alt="" />
+      <header className="rerun-live-head">
+        <div><span>Astra live re-extraction</span><strong>{draft?.title || chart.versions[chart.current_version].spec.title || chart.chart_id}</strong></div>
+        <div className="rerun-meter"><i />{points ? `${points} points · ${series.length} series` : phase === "thinking" ? "Reasoning summary" : "Examining source"}</div>
+      </header>
+      <div className="rerun-live-canvas">
+        <div className="rerun-fog" aria-hidden="true"><i /><i /><i /><i /></div>
+        {series.length ? (
+          <ReactECharts
+            option={{ ...specToOption(liveDraftSpec(draft), { theme, scale: .9 }), animationDurationUpdate: 240, animationEasingUpdate: "cubicOut" }}
+            style={{ width: "100%", height: "100%" }} notMerge={false} lazyUpdate opts={ECHARTS_OPTS}
+          />
+        ) : <div className="rerun-core" aria-hidden="true"><i /><i /><i /></div>}
+      </div>
+      <div className="rerun-thought">
+        <span className="reasoning-mark">A</span>
+        <div><strong>{reasoning ? "Astra summary" : "Live activity"}</strong>{paragraphs.map((p, i) => <p key={`${i}-${p.slice(0, 18)}`}>{p}</p>)}</div>
+      </div>
+      <footer><span>The current version remains untouched until validation finishes.</span><button className="btn btn-sm btn-stop" onClick={onStop} disabled={!job?.job_id || job?.status === "cancelling"}>■ {job?.status === "cancelling" ? "Stopping…" : "Stop re-extraction"}</button></footer>
+    </section>
   );
 }
 

@@ -9,8 +9,8 @@ PyMuPDF==1.25.2
 # Image cropping / manipulation + stroke/text measurement of the original chart
 Pillow==11.1.0
 
-# OpenAI SDK (Responses API + structured outputs via responses.parse)
-openai>=2.2.0
+# OpenAI SDK (Responses streaming helper + parsed structured final response)
+openai>=2.53.0
 
 # Data models / validation + .env loading
 pydantic>=2.10.0

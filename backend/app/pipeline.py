@@ -24,13 +24,13 @@ from PIL import Image
 from . import costs, gate, pdf_processor, storage, style_metrics
 from .config import get_settings
 from .events import bus
-from .openai_client import extract_page
+from .jobs import JobControl, ProcessingCancelled
+from .openai_client import extract_page_stream
 from .schemas import ExtractedChart
 
 
-async def _emit(document_id: str, event: dict[str, Any]) -> None:
-    event["document_id"] = document_id
-    await bus.publish(document_id, event)
+async def _emit(document_id: str, event: dict[str, Any], *, persist: bool = True) -> None:
+    await bus.publish(document_id, event, persist=persist)
 
 
 async def _log(document_id: str, message: str, level: str = "info") -> None:
@@ -71,11 +71,16 @@ def _label(p: dict[str, Any]) -> str:
 # --------------------------------------------------------------------------- #
 # Whole document
 # --------------------------------------------------------------------------- #
-async def process_document(document_id: str) -> None:
+async def process_document(document_id: str, control: JobControl | None = None) -> None:
     settings = get_settings()
     d = storage.doc_dir(document_id)
 
     try:
+        if control:
+            control.check()
+            await _emit(document_id, {
+                "type": "job_started", "job_id": control.job_id, "scope": "document",
+            })
         # -------- 1. Render PDF pages + normalise images into pages --------
         await _emit(document_id, {"type": "status", "status": "rendering", "message": "Preparing pages"})
         storage.set_status(document_id, "rendering", "Preparing pages")
@@ -92,7 +97,8 @@ async def process_document(document_id: str) -> None:
             if total > settings.max_pages:
                 await _log(document_id, f"PDF has {total} pages; processing first {settings.max_pages} (MAX_PAGES cap).", "warn")
             rendered = await asyncio.to_thread(
-                pdf_processor.render_pdf_to_pngs, pdf_path, d / "pages", settings.render_dpi, settings.max_pages
+                pdf_processor.render_pdf_to_pngs, pdf_path, d / "pages", settings.render_dpi,
+                settings.max_pages, control.cancel_event if control else None,
             )
             for pm in rendered:
                 pm["kind"] = "pdf"
@@ -101,6 +107,8 @@ async def process_document(document_id: str) -> None:
 
         next_no = len(pages_meta) + 1
         for src in image_srcs:
+            if control:
+                control.check()
             fn = f"page_{next_no:03d}.png"
             meta = await asyncio.to_thread(_image_to_page_png, d / "sources" / src["filename"], d / "pages" / fn)
             pages_meta.append(
@@ -115,6 +123,8 @@ async def process_document(document_id: str) -> None:
         await _emit(document_id, {"type": "progress", "progress": m["progress"]})
 
         for pm in pages_meta:
+            if control:
+                control.check()
             m = storage.read_manifest(document_id)
             m["pages"].append(
                 {
@@ -125,7 +135,7 @@ async def process_document(document_id: str) -> None:
                     "width": pm["width"],
                     "height": pm["height"],
                     "summary": "",
-                    "status": "pending",  # pending | skipped | analyzed
+                    "status": "pending",  # pending | skipped | analyzed | error
                     "gate": None,
                     "has_charts": False,
                     "chart_ids": [],
@@ -148,14 +158,24 @@ async def process_document(document_id: str) -> None:
 
         running_notes = ""
         for pm in pages_meta:
+            if control:
+                control.check()
             page_no = pm["page_number"]
             label = pm["label"]
             use_gate = gate_on and (pm["kind"] == "pdf" or settings.gate_images)
 
             if use_gate:
+                await _emit(document_id, {"type": "gate_started", "page_number": page_no, "label": label, "model": settings.gate_model})
                 await _emit(document_id, {"type": "status", "status": "analyzing", "message": f"Screening {label} with {settings.gate_model}"})
                 t0 = time.perf_counter()
-                verdict, gusage = await asyncio.to_thread(gate.classify_page, d / "pages" / pm["filename"])
+                verdict, gusage = await asyncio.to_thread(
+                    gate.classify_page,
+                    d / "pages" / pm["filename"],
+                    control.cancel_event if control else None,
+                    control.set_stream_closer if control else None,
+                )
+                if control:
+                    control.check()
                 gusage["seconds"] = round(time.perf_counter() - t0, 2)
 
                 m = storage.read_manifest(document_id)
@@ -173,6 +193,13 @@ async def process_document(document_id: str) -> None:
                     m["progress"]["pages_skipped"] = m["progress"].get("pages_skipped", 0) + 1
                 storage.write_manifest(m)
 
+                await _emit(document_id, {
+                    "type": "gate_result", "page_number": page_no, "label": label,
+                    "has_charts": verdict.has_charts, "chart_count": verdict.chart_count,
+                    "confidence": verdict.confidence, "p_charts": round(p_charts, 3),
+                    "reason": verdict.reason, "skipped": skip,
+                })
+
                 await _emit(document_id, {"type": "usage", "scope": "gate", "page_number": page_no, "usage": gusage,
                                           "totals": gblock["totals"], "model": gblock["model"], "pricing": gblock["pricing"]})
                 if skip:
@@ -182,18 +209,60 @@ async def process_document(document_id: str) -> None:
                     continue
                 await _log(document_id, f"{label}: gate sees {verdict.chart_count} chart(s) ({p_charts:.0%}) → extracting with {settings.openai_model}")
             elif pm["kind"] == "image":
+                await _emit(document_id, {"type": "gate_bypassed", "page_number": page_no, "label": label, "reason": "uploaded_image"})
                 await _log(document_id, f"{label}: uploaded image — sent straight to {settings.openai_model}")
 
-            running_notes = await analyze_page(document_id, page_no, running_notes)
+            try:
+                running_notes = await analyze_page(document_id, page_no, running_notes, control)
+            except ProcessingCancelled:
+                raise
+            except Exception as page_exc:  # noqa: BLE001
+                # Keep the rest of a multi-page document moving. The manifest is
+                # authoritative, so reconnecting clients see the same failed page.
+                m = storage.read_manifest(document_id)
+                page_entry = _find_page(m, page_no)
+                if page_entry.get("status") != "analyzed":
+                    m["progress"]["pages_analyzed"] += 1
+                page_entry["status"] = "error"
+                page_entry["error"] = str(page_exc)
+                page_entry["summary"] = "This page could not be reconstructed."
+                m["progress"]["pages_failed"] = m["progress"].get("pages_failed", 0) + 1
+                storage.write_manifest(m)
+                await _emit(document_id, {
+                    "type": "page_failed", "page_number": page_no, "label": label,
+                    "message": str(page_exc),
+                })
+                await _emit(document_id, {"type": "progress", "progress": m["progress"]})
+                await _log(document_id, f"{label}: extraction failed — continuing with the next page", "error")
 
         # -------- 3. Done --------
+        if control:
+            control.check()
         m = storage.read_manifest(document_id)
         skipped = m["progress"].get("pages_skipped", 0)
+        failed = m["progress"].get("pages_failed", 0)
         done_msg = f"Done — {len(m['charts'])} charts extracted" + (f", {skipped} page(s) skipped by the gate" if skipped else "")
-        storage.set_status(document_id, "complete", done_msg)
+        done_msg += f", {failed} page(s) need attention" if failed else ""
+        if control:
+            def commit_complete() -> None:
+                storage.set_status(document_id, "complete", done_msg)
+                control.status = "completed"
+            control.commit_if_active(commit_complete)
+        else:
+            storage.set_status(document_id, "complete", done_msg)
         await _emit(document_id, {"type": "status", "status": "complete", "message": done_msg})
-        await _emit(document_id, {"type": "complete", "charts_count": len(m["charts"])})
+        await _emit(document_id, {
+            "type": "complete", "charts_count": len(m["charts"]),
+            "pages_skipped": skipped, "pages_failed": failed,
+        })
 
+    except ProcessingCancelled:
+        storage.set_status(document_id, "cancelled", "Stopped by user")
+        await _emit(document_id, {"type": "status", "status": "cancelled", "message": "Stopped by user"})
+        await _emit(document_id, {
+            "type": "job_cancelled", "job_id": control.job_id if control else None,
+            "scope": "document", "message": "Stopped by user",
+        })
     except Exception as exc:  # noqa: BLE001
         import traceback
 
@@ -205,10 +274,14 @@ async def process_document(document_id: str) -> None:
 # --------------------------------------------------------------------------- #
 # One page through the extraction model
 # --------------------------------------------------------------------------- #
-async def analyze_page(document_id: str, page_no: int, running_notes: str = "") -> str:
+async def analyze_page(
+    document_id: str, page_no: int, running_notes: str = "", control: JobControl | None = None
+) -> str:
     """Full extraction for one page: charts, crops, versions, usage, events.
     Returns the updated running notes for the next page."""
     settings = get_settings()
+    if control:
+        control.check()
     d = storage.doc_dir(document_id)
     m = storage.read_manifest(document_id)
     page_entry = _find_page(m, page_no)
@@ -217,10 +290,27 @@ async def analyze_page(document_id: str, page_no: int, running_notes: str = "") 
     total = m.get("page_count") or len(m["pages"])
 
     await _emit(document_id, {"type": "status", "status": "analyzing", "message": f"Reading {label} ({page_no} of {total})"})
+    await _emit(document_id, {
+        "type": "astra_started", "page_number": page_no, "label": label,
+        "model": settings.openai_model, "effort": settings.reasoning_effort,
+    })
     await _log(document_id, f"Sending {label} to {settings.openai_model} ({settings.reasoning_effort} reasoning)…")
 
     t0 = time.perf_counter()
-    extraction, usage = await asyncio.to_thread(extract_page, page_png, page_no, running_notes)
+    loop = asyncio.get_running_loop()
+
+    def forward_stream_event(event: dict[str, Any]) -> None:
+        enriched = {**event, "page_number": page_no, "label": label}
+        future = asyncio.run_coroutine_threadsafe(_emit(document_id, enriched), loop)
+        future.result(timeout=10)
+
+    extraction, usage = await asyncio.to_thread(
+        extract_page_stream, page_png, page_no, running_notes, forward_stream_event,
+        control.cancel_event if control else None,
+        control.set_stream_closer if control else None,
+    )
+    if control:
+        control.check()
     usage["seconds"] = round(time.perf_counter() - t0, 2)
     new_notes = (extraction.updated_running_notes or running_notes)[:2000]
 
@@ -238,9 +328,10 @@ async def analyze_page(document_id: str, page_no: int, running_notes: str = "") 
 
     created_charts: list[dict] = []
     existing_ids = {c["chart_id"] for c in m["charts"]}
-    idx = 0
-    for ec in extraction.charts:
-        idx += 1
+    for model_index, ec in enumerate(extraction.charts):
+        if control:
+            control.check()
+        idx = model_index + 1
         chart_id = f"p{page_no:03d}_c{idx:02d}"
         while chart_id in existing_ids:  # re-analysis of a page: never reuse an id
             idx += 1
@@ -250,12 +341,16 @@ async def analyze_page(document_id: str, page_no: int, running_notes: str = "") 
 
         # crop original region for side-by-side comparison
         crop_meta = await asyncio.to_thread(pdf_processor.crop_chart, page_png, ec.bbox, d / "charts" / f"{chart_id}.png")
+        if control:
+            control.check()
         crop_rel = f"charts/{chart_id}.png"
         await _emit(document_id, {"type": "chart_detected", "chart_id": chart_id, "page_number": page_no, "crop_image": crop_rel})
 
         spec = _spec_from_extracted(ec, crop_box=crop_meta.get("box_norm"))
         # measure the original's stroke weight / text size from the crop (no model call)
         spec["style_metrics"] = await asyncio.to_thread(style_metrics.measure, d / "charts" / f"{chart_id}.png", spec.get("plot_rect"), spec)
+        if control:
+            control.check()
         chart_obj = {
             "chart_id": chart_id,
             "page_number": page_no,
@@ -271,10 +366,19 @@ async def analyze_page(document_id: str, page_no: int, running_notes: str = "") 
         page_entry["chart_ids"].append(chart_id)
         created_charts.append(chart_obj)
         m["progress"]["charts_extracted"] += 1
+        # Make the authoritative chart durable before announcing it to clients.
+        m["charts_count"] = len(m["charts"])
+        storage.write_manifest(m)
+        await _emit(document_id, {
+            "type": "chart_validated", "page_number": page_no, "chart_index": model_index,
+            "draft_id": f"p{page_no:03d}_draft{model_index + 1:02d}", "chart": chart_obj,
+        })
         await _emit(document_id, {"type": "chart_extracted", "chart": chart_obj})
         await _emit(document_id, {"type": "progress", "progress": m["progress"]})
 
     m["charts_count"] = len(m["charts"])
+    if control:
+        control.check()
     storage.write_manifest(m)
     await _emit(document_id, {"type": "usage", "scope": "extract", "page_number": page_no, "usage": usage,
                               "totals": ublock["totals"], "model": ublock["model"], "pricing": ublock["pricing"]})
@@ -284,12 +388,13 @@ async def analyze_page(document_id: str, page_no: int, running_notes: str = "") 
     (d / f"page_{page_no:03d}.txt").write_text(f"<document_page>\n{xml}\n</document_page>\n", encoding="utf-8")
 
     await _emit(document_id, {"type": "page_analyzed", "page_number": page_no, "summary": extraction.summary, "charts_found": len(created_charts)})
+    await _emit(document_id, {"type": "page_validated", "page_number": page_no, "label": label, "summary": extraction.summary, "charts_found": len(created_charts)})
     await _emit(document_id, {"type": "progress", "progress": m["progress"]})
     return new_notes
 
 
 async def analyze_page_now(document_id: str, page_no: int) -> dict[str, Any]:
-    """Manual override ("Process anyway") for a page the gate skipped. Returns the manifest."""
+    """Manual extraction/retry for a skipped or failed page. Returns the manifest."""
     m = storage.read_manifest(document_id)
     page_entry = _find_page(m, page_no)
     if page_entry.get("status") == "skipped":
@@ -298,14 +403,47 @@ async def analyze_page_now(document_id: str, page_no: int) -> dict[str, Any]:
         if isinstance(page_entry.get("gate"), dict):
             page_entry["gate"]["skipped"] = False
             page_entry["gate"]["overridden"] = True
+    elif page_entry.get("status") == "error":
+        m["progress"]["pages_failed"] = max(0, m["progress"].get("pages_failed", 0) - 1)
+        m["progress"]["pages_analyzed"] = max(0, m["progress"].get("pages_analyzed", 0) - 1)
+        # A late failure can leave already validated charts from this page. A retry
+        # replaces that partial page result so it cannot produce duplicate charts.
+        partial_ids = set(page_entry.get("chart_ids") or [])
+        if partial_ids:
+            m["charts"] = [chart for chart in m.get("charts", []) if chart.get("chart_id") not in partial_ids]
+            m["charts_count"] = len(m["charts"])
+            m["progress"]["charts_detected"] = max(0, m["progress"].get("charts_detected", 0) - len(partial_ids))
+            m["progress"]["charts_extracted"] = max(0, m["progress"].get("charts_extracted", 0) - len(partial_ids))
+            page_entry["chart_ids"] = []
+            page_entry["has_charts"] = False
+        page_entry.pop("error", None)
     page_entry["status"] = "pending"
     storage.write_manifest(m)
 
-    await analyze_page(document_id, page_no, "")
+    try:
+        await analyze_page(document_id, page_no, "")
+    except Exception as exc:  # noqa: BLE001
+        m = storage.read_manifest(document_id)
+        page_entry = _find_page(m, page_no)
+        if page_entry.get("status") != "analyzed":
+            m["progress"]["pages_analyzed"] += 1
+        page_entry["status"] = "error"
+        page_entry["error"] = str(exc)
+        page_entry["summary"] = "This page could not be reconstructed."
+        m["progress"]["pages_failed"] = m["progress"].get("pages_failed", 0) + 1
+        storage.write_manifest(m)
+        await _emit(document_id, {
+            "type": "page_failed", "page_number": page_no, "label": _label(page_entry),
+            "message": str(exc),
+        })
+        await _emit(document_id, {"type": "progress", "progress": m["progress"]})
+        raise
 
     m = storage.read_manifest(document_id)
     skipped = m["progress"].get("pages_skipped", 0)
+    failed = m["progress"].get("pages_failed", 0)
     done_msg = f"Done — {len(m['charts'])} charts extracted" + (f", {skipped} page(s) skipped by the gate" if skipped else "")
+    done_msg += f", {failed} page(s) need attention" if failed else ""
     storage.set_status(document_id, "complete", done_msg)
     return storage.read_manifest(document_id)
 

@@ -2,12 +2,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Event
 
 import fitz  # PyMuPDF
 from PIL import Image
 
+from .jobs import ProcessingCancelled
 
-def render_pdf_to_pngs(pdf_path: Path, out_dir: Path, dpi: int, max_pages: int) -> list[dict]:
+
+def render_pdf_to_pngs(
+    pdf_path: Path, out_dir: Path, dpi: int, max_pages: int, cancel_event: Event | None = None
+) -> list[dict]:
     """Render each page to a PNG. Returns list of {page_number, filename, width, height}."""
     out_dir.mkdir(parents=True, exist_ok=True)
     pages: list[dict] = []
@@ -15,6 +20,8 @@ def render_pdf_to_pngs(pdf_path: Path, out_dir: Path, dpi: int, max_pages: int) 
     try:
         total = min(len(doc), max_pages)
         for i in range(total):
+            if cancel_event and cancel_event.is_set():
+                raise ProcessingCancelled("Stopped by user")
             page = doc[i]
             pix = page.get_pixmap(dpi=dpi)  # 1.19.2+ dpi shortcut
             filename = f"page_{i + 1:03d}.png"
@@ -27,6 +34,8 @@ def render_pdf_to_pngs(pdf_path: Path, out_dir: Path, dpi: int, max_pages: int) 
                     "height": pix.height,
                 }
             )
+            if cancel_event and cancel_event.is_set():
+                raise ProcessingCancelled("Stopped by user")
     finally:
         doc.close()
     return pages

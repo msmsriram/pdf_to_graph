@@ -24,7 +24,8 @@ from fastapi.staticfiles import StaticFiles
 from . import costs, pipeline, storage, style_metrics
 from .config import get_settings
 from .events import bus
-from .openai_client import extract_single_chart
+from .jobs import JobControl, ProcessingCancelled, registry as job_registry
+from .openai_client import extract_single_chart_stream
 from .schemas import RerunRequest, SaveVersionRequest
 
 REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max"}
@@ -43,6 +44,15 @@ app.add_middleware(
 
 # Serve rendered pages / chart crops.
 app.mount("/storage", StaticFiles(directory=str(settings.storage_path)), name="storage")
+
+
+async def _run_document_job(control: JobControl) -> None:
+    try:
+        await pipeline.process_document(control.document_id, control)
+    finally:
+        manifest = storage.read_manifest(control.document_id) or {}
+        status = "cancelled" if control.cancel_event.is_set() else manifest.get("status", "failed")
+        job_registry.finish(control, status)
 
 
 @app.get("/api/health")
@@ -104,14 +114,19 @@ async def upload_document(
     original_filename = pdfs[0].filename if pdfs else (images[0].filename or "images")
     storage.create_manifest(document_id, name=doc_name, original_filename=original_filename, sources=sources)
 
-    # Kick off background processing (fire and forget; progress via WebSocket).
-    asyncio.create_task(pipeline.process_document(document_id))
-    return {"document_id": document_id, "name": doc_name, "status": "uploaded", "sources": sources}
+    # Kick off a tracked background job; progress and cancellation use its id.
+    control = job_registry.create(document_id, "document")
+    task = asyncio.create_task(_run_document_job(control))
+    job_registry.attach(control, task)
+    return {
+        "document_id": document_id, "name": doc_name, "status": "uploaded",
+        "sources": sources, "job_id": control.job_id,
+    }
 
 
 @app.post("/api/documents/{document_id}/pages/{page_number}/analyze")
 async def analyze_page_override(document_id: str, page_number: int) -> dict:
-    """'Process anyway': run the extraction model on a page the gate skipped. Returns the document."""
+    """Run extraction for a gate-skipped page or retry a page that failed."""
     m = storage.read_manifest(document_id)
     if not m:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -147,7 +162,8 @@ async def get_document(document_id: str) -> dict:
     changed = costs.refresh_pricing(m) or changed
     if changed:
         storage.write_manifest(m)
-    return m
+    # Runtime-only reconnect metadata: this must never be persisted in the manifest.
+    return {**m, "active_jobs": job_registry.list_active(document_id)}
 
 
 def _ensure_style_metrics(m: dict, document_id: str) -> bool:
@@ -229,10 +245,84 @@ async def finalize(document_id: str, chart_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Document or chart not found")
 
 
-@app.post("/api/documents/{document_id}/charts/{chart_id}/rerun")
+async def _run_chart_rerun(
+    control: JobControl, crop: Path, prior: dict, page_number: int,
+    effort: str | None, model: str | None,
+) -> None:
+    document_id = control.document_id
+    chart_id = control.chart_id or ""
+    draft_id = f"rerun_{control.job_id}"
+    loop = asyncio.get_running_loop()
+
+    async def emit(event: dict) -> None:
+        await bus.publish(document_id, {
+            **event, "job_id": control.job_id, "scope": "chart",
+            "chart_id": chart_id, "draft_id": draft_id, "page_number": page_number,
+        })
+
+    event_names = {
+        "reasoning_summary_delta": "chart_rerun_reasoning_delta",
+        "chart_draft_started": "chart_rerun_draft_started",
+        "chart_draft_axes": "chart_rerun_draft_axes",
+        "series_draft_started": "chart_rerun_series_started",
+        "points_draft_batch": "chart_rerun_points_batch",
+    }
+
+    def forward_stream_event(event: dict) -> None:
+        mapped = {**event, "type": event_names.get(event.get("type"), event.get("type"))}
+        future = asyncio.run_coroutine_threadsafe(emit(mapped), loop)
+        future.result(timeout=10)
+
+    try:
+        await emit({"type": "job_started"})
+        await emit({"type": "chart_rerun_started", "effort": effort or settings.reasoning_effort, "model": model or settings.openai_model})
+        t0 = time.perf_counter()
+        ec, usage = await asyncio.to_thread(
+            extract_single_chart_stream, crop, prior, page_number, forward_stream_event,
+            control.cancel_event, control.set_stream_closer, effort, model,
+        )
+        control.check()
+        usage["seconds"] = round(time.perf_counter() - t0, 2)
+        usage["cost_usd"] = costs.cost_usd(usage, costs.pricing_for(usage["model"]))
+        spec = pipeline._spec_from_extracted(ec)
+        spec["style_metrics"] = await asyncio.to_thread(style_metrics.measure, crop, spec.get("plot_rect"), spec)
+        control.check()
+
+        def commit() -> dict:
+            chart_out = storage.add_version(
+                document_id, chart_id, spec,
+                label=f"Re-extracted · {usage['model']} · {usage['effort']}",
+                kind="rerun", extra={"usage": usage},
+            )
+            m2 = storage.read_manifest(document_id)
+            ublock = costs.ensure_usage_block(m2, settings.openai_model)
+            ublock["reruns"].append({
+                "chart_id": chart_id, "version": chart_out["current_version"],
+                "at": storage._now(), **usage,
+            })
+            costs.add_to_totals(ublock["totals"], usage)
+            storage.write_manifest(m2)
+            control.status = "completed"
+            return storage.find_chart(m2, chart_id) or chart_out
+
+        chart_out = control.commit_if_active(commit)
+        await emit({"type": "chart_rerun_complete", "chart": chart_out, "usage": usage})
+        await emit({"type": "job_finished", "status": "completed"})
+    except ProcessingCancelled:
+        control.status = "cancelled"
+        await emit({"type": "chart_rerun_cancelled", "message": "Stopped by user"})
+        await emit({"type": "job_cancelled", "message": "Stopped by user"})
+    except Exception as exc:  # noqa: BLE001
+        control.status = "failed"
+        await emit({"type": "chart_rerun_failed", "message": str(exc)})
+        await emit({"type": "job_finished", "status": "failed"})
+    finally:
+        job_registry.finish(control, control.status)
+
+
+@app.post("/api/documents/{document_id}/charts/{chart_id}/rerun", status_code=202)
 async def rerun_chart(document_id: str, chart_id: str, body: RerunRequest) -> dict:
-    """Re-extract ONE chart from its crop (optionally at a higher reasoning effort /
-    different model) and append the result as a new version. v0 is never touched."""
+    """Start a cancellable, streamed re-extraction job for one chart."""
     m = storage.read_manifest(document_id)
     if not m:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -246,33 +336,29 @@ async def rerun_chart(document_id: str, chart_id: str, body: RerunRequest) -> di
     if not crop.exists():
         raise HTTPException(status_code=404, detail="Chart crop image is missing")
 
-    prior = chart["versions"][chart["current_version"]]["spec"]
-    t0 = time.perf_counter()
     try:
-        ec, usage = await asyncio.to_thread(extract_single_chart, crop, prior, body.effort, body.model)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"Re-extraction failed: {exc}")
-    usage["seconds"] = round(time.perf_counter() - t0, 2)
-    usage["cost_usd"] = costs.cost_usd(usage, costs.pricing_for(usage["model"]))
-
-    spec = pipeline._spec_from_extracted(ec)
-    spec["style_metrics"] = await asyncio.to_thread(style_metrics.measure, crop, spec.get("plot_rect"), spec)
-    chart_out = storage.add_version(
-        document_id,
-        chart_id,
-        spec,
-        label=f"Re-extracted · {usage['model']} · {usage['effort']}",
-        kind="rerun",
-        extra={"usage": usage},
+        control = job_registry.create(document_id, "chart", chart_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    prior = chart["versions"][chart["current_version"]]["spec"]
+    task = asyncio.create_task(
+        _run_chart_rerun(control, crop, prior, chart["page_number"], body.effort, body.model)
     )
+    job_registry.attach(control, task)
+    return {"job_id": control.job_id, "status": "running", "chart_id": chart_id}
 
-    # Document-level accounting: list the re-run and add it to the totals.
-    m2 = storage.read_manifest(document_id)
-    ublock = costs.ensure_usage_block(m2, settings.openai_model)
-    ublock["reruns"].append({"chart_id": chart_id, "version": chart_out["current_version"], "at": storage._now(), **usage})
-    costs.add_to_totals(ublock["totals"], usage)
-    storage.write_manifest(m2)
-    return chart_out
+
+@app.post("/api/documents/{document_id}/jobs/{job_id}/cancel")
+async def cancel_job(document_id: str, job_id: str) -> dict:
+    control = await asyncio.to_thread(job_registry.cancel, document_id, job_id)
+    if not control:
+        raise HTTPException(status_code=404, detail="Active job not found")
+    if control.status == "cancelling":
+        await bus.publish(document_id, {
+            "type": "job_cancel_requested", "job_id": job_id, "scope": control.scope,
+            "chart_id": control.chart_id,
+        })
+    return {"job_id": job_id, "status": control.status}
 
 
 # --------------------------------------------------------------------------- #
@@ -281,8 +367,12 @@ async def rerun_chart(document_id: str, chart_id: str, body: RerunRequest) -> di
 @app.websocket("/ws/documents/{document_id}")
 async def ws_documents(websocket: WebSocket, document_id: str) -> None:
     await websocket.accept()
+    try:
+        after_sequence = max(0, int(websocket.query_params.get("after", "0")))
+    except ValueError:
+        after_sequence = 0
     # Atomic (no await between): snapshot backlog, then subscribe to future events.
-    backlog = bus.get_backlog(document_id)
+    backlog = bus.get_backlog(document_id, after_sequence=after_sequence)
     queue = bus.subscribe(document_id)
     try:
         for event in backlog:

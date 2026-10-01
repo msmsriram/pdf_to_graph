@@ -44,6 +44,14 @@ def _manifest_path(document_id: str) -> Path:
     return doc_dir(document_id) / "manifest.json"
 
 
+def _write_json_atomic(path: Path, value: Any) -> None:
+    """Replace a JSON file only after its complete payload is on disk."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+
+
 # --------------------------------------------------------------------------- #
 # Manifest read/write
 # --------------------------------------------------------------------------- #
@@ -59,7 +67,7 @@ def write_manifest(manifest: dict[str, Any]) -> None:
     document_id = manifest["document_id"]
     p = _manifest_path(document_id)
     with _lock:
-        p.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+        _write_json_atomic(p, manifest)
     _upsert_index(manifest)
 
 
@@ -87,6 +95,7 @@ def create_manifest(
             "pages_rendered": 0,
             "pages_analyzed": 0,
             "pages_skipped": 0,
+            "pages_failed": 0,
             "charts_detected": 0,
             "charts_extracted": 0,
         },
@@ -143,7 +152,7 @@ def _upsert_index(manifest: dict[str, Any]) -> None:
         idx = read_index()
         idx = [e for e in idx if e["document_id"] != manifest["document_id"]]
         idx.insert(0, entry)
-        _index_path().write_text(json.dumps(idx, indent=2, ensure_ascii=False), encoding="utf-8")
+        _write_json_atomic(_index_path(), idx)
 
 
 def delete_document(document_id: str) -> bool:
@@ -154,7 +163,7 @@ def delete_document(document_id: str) -> bool:
         if d.exists():
             shutil.rmtree(d, ignore_errors=True)
         idx = [e for e in read_index() if e["document_id"] != document_id]
-        _index_path().write_text(json.dumps(idx, indent=2, ensure_ascii=False), encoding="utf-8")
+        _write_json_atomic(_index_path(), idx)
     return True
 
 

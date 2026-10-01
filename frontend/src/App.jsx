@@ -12,6 +12,7 @@ export default function App() {
   const documentId = useStore((s) => s.documentId);
   const handleEvent = useStore((s) => s.handleEvent);
   const setDocument = useStore((s) => s.setDocument);
+  const setConnectionState = useStore((s) => s.setConnectionState);
   const goHome = useStore((s) => s.goHome);
   const theme = useStore((s) => s.theme);
   const toggleTheme = useStore((s) => s.toggleTheme);
@@ -26,17 +27,22 @@ export default function App() {
   // Live processing subscription (active in processing view).
   useEffect(() => {
     if (view !== "processing" || !documentId) return;
-    const close = subscribeDocument(documentId, async (ev) => {
-      handleEvent(ev);
-      if (ev.type === "complete" || ev.type === "error") {
-        try {
-          const doc = await api.getDocument(documentId);
-          setDocument(doc);
-        } catch (_) {}
-      }
-    });
+    const close = subscribeDocument(
+      documentId,
+      async (ev) => {
+        handleEvent(ev);
+        if (["complete", "error", "job_cancelled", "chart_rerun_complete"].includes(ev.type)) {
+          try {
+            const doc = await api.getDocument(documentId);
+            setDocument(doc);
+          } catch (_) {}
+        }
+      },
+      setConnectionState,
+      useStore.getState().lastSequence
+    );
     return close;
-  }, [view, documentId, handleEvent, setDocument]);
+  }, [view, documentId, handleEvent, setDocument, setConnectionState]);
 
   return (
     <>

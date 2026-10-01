@@ -5,7 +5,7 @@ import { useStore } from "../store.js";
 import { api } from "../lib/api.js";
 
 function StatusPill({ status }) {
-  const label = { uploaded: "Queued", rendering: "Rendering", analyzing: "Analyzing", complete: "Ready", error: "Failed" }[status] || status;
+  const label = { uploaded: "Queued", rendering: "Rendering", analyzing: "Analyzing", complete: "Ready", error: "Failed", cancelled: "Stopped" }[status] || status;
   return (
     <span className={`pill ${status}`}>
       <span className="dot" />
@@ -115,7 +115,7 @@ export default function Home() {
     try {
       const res = await api.uploadBundle({ pdf: pdf?.file, images: images.map((i) => ({ file: i.file, label: i.label.trim() })), name: name.trim() }, setUploadPct);
       clear();
-      startProcessing(res.document_id, res.name);
+      startProcessing(res.document_id, res.name, res.job_id);
     } catch (e) {
       setError(e?.response?.data?.detail || "Upload failed");
     } finally {
@@ -126,8 +126,12 @@ export default function Home() {
   const openDoc = async (id) => {
     try {
       const doc = await api.getDocument(id);
-      if (doc.status === "complete" || doc.status === "error" || (doc.charts && doc.charts.length)) openWorkspace(doc);
-      else startProcessing(doc.document_id, doc.name); // still processing — re-attach to the live feed
+      if (["complete", "error", "cancelled"].includes(doc.status)) {
+        openWorkspace(doc);
+      } else {
+        const activeJob = (doc.active_jobs || []).find((job) => job.scope === "document");
+        startProcessing(doc.document_id, doc.name, activeJob?.job_id || null); // re-attach to live + Stop
+      }
     } catch (_) {}
   };
 

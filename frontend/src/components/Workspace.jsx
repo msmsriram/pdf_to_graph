@@ -4,7 +4,7 @@ import { api, assetUrl } from "../lib/api.js";
 import ChartEditor from "./ChartEditor.jsx";
 
 // Per-page status list: what the gate decided, what was extracted, and a
-// "Process anyway" button for pages the gate skipped (runs the extraction model).
+// retry button for pages the gate skipped or whose extraction failed.
 function PagesPanel({ document, compact }) {
   const setDocument = useStore((s) => s.setDocument);
   const [busy, setBusy] = useState(null);
@@ -34,8 +34,11 @@ function PagesPanel({ document, compact }) {
         {pages.map((p) => {
           const g = p.gate;
           const skipped = p.status === "skipped";
+          const failed = p.status === "error";
           const n = (p.chart_ids || []).length;
-          const state = skipped
+          const state = failed
+            ? "extraction failed"
+            : skipped
             ? "skipped by gate"
             : p.status === "analyzed"
               ? `${n} chart${n === 1 ? "" : "s"}${g && g.overridden ? " · forced" : ""}`
@@ -49,9 +52,9 @@ function PagesPanel({ document, compact }) {
                 {p.label || `Page ${p.page_number}`}
               </span>
               <span className="m">{state}</span>
-              {skipped && (
+              {(skipped || failed) && (
                 <button className="btn btn-sm" disabled={busy != null} onClick={() => force(p.page_number)} title="Run the extraction model on this page anyway">
-                  {busy === p.page_number ? "Reading…" : "Process anyway"}
+                  {busy === p.page_number ? "Reading…" : failed ? "Retry page" : "Process anyway"}
                 </button>
               )}
             </div>
