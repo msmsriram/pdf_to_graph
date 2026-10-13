@@ -14,7 +14,8 @@ Method
   Text and gridlines are ignored by construction, and each series gets its own width.
 - curve stroke (fallback, no usable geometry): pixel-weighted median width of ink that
   is not a full-length axis-aligned line.
-- grid width: thinnest common width among full-length horizontal/vertical ink lines.
+- grid width: thinnest common width among full-length horizontal/vertical ink lines,
+  ignoring a band around the extracted curves (a flat curve spanning the plot is not a gridline).
 - text: the first band of inked rows under the plot area is the x tick labels; its
   height is the digit (cap) height; font size ≈ cap height / 0.72.
 """
@@ -25,12 +26,12 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 CAP_HEIGHT_RATIO = 0.72  # digit/cap height as a fraction of font size (Arial-like)
 AA_ALLOWANCE = 0.5  # anti-aliasing adds roughly half a pixel of "ink" at our threshold
 # Bump when the method changes: stored metrics with an older version are re-measured on open.
-METRICS_VERSION = 3
+METRICS_VERSION = 4
 
 
 # ----------------------------------------------------------------------------- basics
@@ -121,6 +122,19 @@ def _curve_pixels(spec: dict, rect_px: tuple[int, int, int, int]) -> list[list[t
             poly.append((cx, cy))
         out.append(poly)
     return out
+
+
+def _curve_band(polys: list[list[tuple[float, float]]], shape: tuple[int, int], width: int) -> Optional[np.ndarray]:
+    """Boolean mask of every pixel within ~width/2 of any curve polyline (None if no curves)."""
+    if not any(len(p) >= 2 for p in polys):
+        return None
+    H, W = shape
+    band = Image.new("L", (W, H), 0)
+    draw = ImageDraw.Draw(band)
+    for p in polys:
+        if len(p) >= 2:
+            draw.line(p, fill=255, width=width, joint="curve")
+    return np.asarray(band) > 0
 
 
 def _min_dist_to_polyline(x: float, y: float, poly: np.ndarray) -> float:
@@ -221,6 +235,14 @@ def measure(crop_path: Path, plot_rect: Optional[list[float]] = None, spec: Opti
     if x1 - x0 < 30 or y1 - y0 < 30:
         return None
 
+    # Where the extracted curves run, in crop pixels. A band around them is excluded from
+    # gridline detection: a flat curve (or a bundle of converged curves, e.g. Z=1 on a
+    # transient-thermal chart) spanning the whole plot is a full-length line too, and when
+    # the real gridlines are interrupted by note boxes it would be the ONLY one — its bold
+    # black ink would then be taken as the grid's width and colour.
+    polys = _curve_pixels(spec, (x0, y0, x1, y1)) if spec else []
+    curve_band = _curve_band(polys, (H, W), max(9, int(round(0.03 * (y1 - y0)))))
+
     # ---- grid width (and global fallback material) from the plot interior ----
     ix, iy = max(2, int(0.02 * (x1 - x0))), max(2, int(0.02 * (y1 - y0)))
     sub = ink[y0 + iy : y1 - iy, x0 + ix : x1 - ix]
@@ -233,6 +255,8 @@ def measure(crop_path: Path, plot_rect: Optional[list[float]] = None, spec: Opti
         hr, vr = _runs(sub, 1), _runs(sub, 0)
         width = np.minimum(hr, vr)
         full_line = sub & ((hr > 0.85 * pw) | (vr > 0.85 * ph))
+        if curve_band is not None:
+            full_line &= ~curve_band[y0 + iy : y1 - iy, x0 + ix : x1 - ix]
         if full_line.any():
             counts = np.bincount(width[full_line])
             if counts.size > 1:
@@ -251,7 +275,6 @@ def measure(crop_path: Path, plot_rect: Optional[list[float]] = None, spec: Opti
     min_run_steps = int(round((grid_w + 0.5) * 2)) if grid_w is not None else 2
     series_w: list[Optional[float]] = []
     if spec:
-        polys = _curve_pixels(spec, (x0, y0, x1, y1))
         arrs = [np.asarray(p, dtype=float) for p in polys]
         for i, poly in enumerate(polys):
             if len(poly) < 2:
