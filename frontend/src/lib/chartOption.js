@@ -309,7 +309,9 @@ export function specToOption(
     !overlay && spec.inline_labels !== false && !categorical && (spec.chart_type === "line" || spec.chart_type === "area");
 
   const echSeries = series.map((se, i) => {
-    const color = se.color || PALETTE[i % PALETTE.length];
+    // Overlay: a black/gray curve laid over a black-ink original would read as part of the
+    // PDF itself, so achromatic curves are drawn in a contrasting colour there.
+    const color = overlay && isAchromatic(se.color) ? OVERLAY_INK : se.color || PALETTE[i % PALETTE.length];
     const t = spec.chart_type === "scatter" ? "scatter" : spec.chart_type === "bar" ? "bar" : "line";
     const raw = categorical
       ? (se.points || []).map((p) => p.y ?? 0)
@@ -463,6 +465,18 @@ export function specToOption(
 }
 
 /* ------------------------------------------------------------------ helpers */
+const OVERLAY_INK = "#e5484d";
+
+// True for black / gray / white hex colours (no hue to tell them apart from the original's ink).
+function isAchromatic(hex) {
+  const m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(String(hex || "").trim());
+  if (!m) return false;
+  const h = m[1].length === 3 ? m[1].replace(/./g, "$&$&") : m[1];
+  const [r, g, b] = [0, 2, 4].map((o) => parseInt(h.slice(o, o + 2), 16));
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+  return mx === 0 || (mx - mn) / mx < 0.2;
+}
+
 // The name a bundle of series shares: their longest common prefix, minus a dangling
 // separator (e.g. 'VGS=7~10V (upper)' + 'VGS=7~10V (lower)' -> 'VGS=7~10V').
 function sharedLabel(names) {
