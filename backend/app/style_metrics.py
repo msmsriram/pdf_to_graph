@@ -12,6 +12,9 @@ Method
   through the plot rectangle and axis ranges — so along each curve we read the ink
   profile PERPENDICULAR to the local direction and take the run through the centre.
   Text and gridlines are ignored by construction, and each series gets its own width.
+  The per-series value is the MODE of the samples (gridline merges inflate many samples by
+  varying amounts; clean ones agree), and a series only keeps a width far from the chart's
+  when the model's line_width hint agrees ('thick'/'thin').
 - curve stroke (fallback, no usable geometry): pixel-weighted median width of ink that
   is not a full-length axis-aligned line.
 - grid width: thinnest common width among full-length horizontal/vertical ink lines,
@@ -31,7 +34,7 @@ from PIL import Image, ImageDraw
 CAP_HEIGHT_RATIO = 0.72  # digit/cap height as a fraction of font size (Arial-like)
 AA_ALLOWANCE = 0.5  # anti-aliasing adds roughly half a pixel of "ink" at our threshold
 # Bump when the method changes: stored metrics with an older version are re-measured on open.
-METRICS_VERSION = 5
+METRICS_VERSION = 6
 
 
 # ----------------------------------------------------------------------------- basics
@@ -157,7 +160,7 @@ def _stroke_along(
     radius: int = 14,
     isolation_px: float = 6.0,
 ) -> Optional[float]:
-    """Trimmed-mean ink run-length perpendicular to the curve, sampled every ~4 px along it,
+    """Typical (modal) ink run-length perpendicular to the curve, sampled every ~4 px along it,
     using only samples where no OTHER curve passes within `isolation_px` (a bundle of
     touching curves would otherwise measure as one wide stroke)."""
     H, W = ink.shape
@@ -206,12 +209,19 @@ def _stroke_along(
             widths.append((best[1] - best[0]) * 0.5)
     if tries == 0 or len(widths) < 10 or len(widths) < 0.3 * tries:
         return None
-    # Trimmed mean of the middle 60%: drops the top (curve merging with a parallel gridline
-    # or another curve) and the bottom (near-misses), and — unlike a median — gives a fair
-    # compromise when a curve is drawn thinner in its flat parts than in its steep parts.
+    # Middle 60% (drops near-misses at the bottom and curve+other-curve merges at the top),
+    # then the MODE of what is left, not the mean. On dense log paper a flat curve runs
+    # 1–3 px from parallel gridlines, so many samples read curve+gridline as one wider run;
+    # those inflations scatter over many larger values while the clean samples between
+    # gridlines all agree — the most common width is the curve's own stroke.
     arr = np.sort(np.asarray(widths))
     lo, hi = int(len(arr) * 0.2), max(int(len(arr) * 0.2) + 1, int(len(arr) * 0.8))
-    return float(np.mean(arr[lo:hi]))
+    half = np.rint(arr[lo:hi] * 2).astype(int)  # widths come in 0.5 px steps
+    counts = np.bincount(half).astype(float)
+    smooth = np.convolve(counts, [1.0, 2.0, 1.0], mode="same")  # ties between neighbours
+    k = int(np.argmax(smooth))
+    win = np.arange(max(0, k - 1), min(len(counts), k + 2))
+    return float((counts[win] * win).sum() / max(counts[win].sum(), 1.0) / 2.0)
 
 
 # ---------------------------------------------------------------------------- measure
@@ -287,8 +297,15 @@ def measure(crop_path: Path, plot_rect: Optional[list[float]] = None, spec: Opti
     curve_w: Optional[float] = float(np.median(good)) if good else None
     stroke_source = "curves" if good else "fallback"
     # Series with no isolated stretch (fully inside a bundle) inherit the chart's typical stroke.
+    # A series measuring clearly bolder/thinner than the chart keeps its own width only when the
+    # model ALSO calls it 'thick'/'thin' — otherwise the outlier is gridline/bundle noise and the
+    # curve gets the chart's stroke (the model gives relative weight, the image absolute pixels).
     if curve_w is not None:
-        series_w = [curve_w if w is None else w for w in series_w]
+        hints = [s.get("line_width") for s in (spec or {}).get("series") or []]
+        for i, w in enumerate(series_w):
+            hint = hints[i] if i < len(hints) else None
+            if w is None or (w > 1.4 * curve_w and hint != "thick") or (w < 0.7 * curve_w and hint != "thin"):
+                series_w[i] = curve_w
     elif rest is not None and width is not None and rest.any():
         curve_w = max(1.0, float(np.median(width[rest])) - AA_ALLOWANCE)
     # Sanity: datasheet gridlines are hairlines. A "grid" 3+ px wide and nearly as heavy as the
