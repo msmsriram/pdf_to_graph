@@ -71,6 +71,47 @@ def _label(p: dict[str, Any]) -> str:
 # --------------------------------------------------------------------------- #
 # Whole document
 # --------------------------------------------------------------------------- #
+# Running processing tasks by document id (also keeps a strong reference: the event loop
+# holds tasks only weakly, so an unreferenced task can be garbage-collected mid-run).
+_tasks: dict[str, asyncio.Task] = {}
+
+
+def start(document_id: str) -> None:
+    """Kick off background processing for a freshly uploaded document."""
+    task = asyncio.create_task(process_document(document_id))
+    _tasks[document_id] = task
+    task.add_done_callback(lambda t: _tasks.pop(document_id, None) if _tasks.get(document_id) is t else None)
+
+
+async def cancel(document_id: str) -> bool:
+    """Stop a document's processing. Charts already extracted are kept. A model call that is
+    in flight can't be aborted mid-request: it finishes in its thread and its result is
+    discarded. Returns False if nothing was running."""
+    task = _tasks.get(document_id)
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return True
+    # No live task (e.g. the server restarted mid-run): an 'in progress' status is stale.
+    m = storage.read_manifest(document_id)
+    if m and m.get("status") in {"uploaded", "rendering", "analyzing"}:
+        await _mark_cancelled(document_id)
+        return True
+    return False
+
+
+async def _mark_cancelled(document_id: str) -> None:
+    m = storage.read_manifest(document_id)
+    n = len(m.get("charts", [])) if m else 0
+    msg = f"Stopped by user — {n} chart(s) extracted before stopping"
+    storage.set_status(document_id, "cancelled", msg)
+    await _emit(document_id, {"type": "status", "status": "cancelled", "message": msg})
+    await _log(document_id, msg, "warn")
+
+
 async def process_document(document_id: str) -> None:
     settings = get_settings()
     d = storage.doc_dir(document_id)
@@ -194,6 +235,9 @@ async def process_document(document_id: str) -> None:
         await _emit(document_id, {"type": "status", "status": "complete", "message": done_msg})
         await _emit(document_id, {"type": "complete", "charts_count": len(m["charts"])})
 
+    except asyncio.CancelledError:
+        await _mark_cancelled(document_id)
+        raise
     except Exception as exc:  # noqa: BLE001
         import traceback
 

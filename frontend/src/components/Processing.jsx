@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import ReactECharts from "echarts-for-react";
 import { useStore } from "../store.js";
@@ -23,7 +23,7 @@ function Stat({ num, label, cls }) {
 }
 
 export default function Processing() {
-  const { document, status, statusMessage, progress, logs, liveCharts, openWorkspace, documentId, theme } = useStore();
+  const { document, status, statusMessage, progress, logs, liveCharts, openWorkspace, documentId, theme, setDocument } = useStore();
   const logRef = useRef(null);
 
   useEffect(() => {
@@ -41,6 +41,21 @@ export default function Processing() {
     openWorkspace(doc);
   };
 
+  const running = ["uploaded", "rendering", "analyzing"].includes(status);
+  const [stopping, setStopping] = useState(false);
+  const stop = async () => {
+    if (!window.confirm("Stop processing? Charts extracted so far are kept. A page already being read by the model can't be aborted mid-request — its result is discarded.")) return;
+    setStopping(true);
+    try {
+      const doc = await api.cancelDocument(documentId);
+      setDocument(doc);
+      useStore.setState({ status: doc.status, statusMessage: doc.status_message });
+    } catch (_) {
+    } finally {
+      setStopping(false);
+    }
+  };
+
   return (
     <div className="container wide page">
       <div className="proc-head">
@@ -48,11 +63,17 @@ export default function Processing() {
           <h2 style={{ fontSize: 22, fontWeight: 650 }}>{document?.name}</h2>
           <div className="muted" style={{ marginTop: 4 }}>{statusMessage}</div>
         </div>
-        {status === "complete" && (
+        {running && (
+          <button className="btn btn-danger" onClick={stop} disabled={stopping}>
+            {stopping ? "Stopping…" : "■ Stop"}
+          </button>
+        )}
+        {(status === "complete" || (status === "cancelled" && liveCharts.length > 0)) && (
           <button className="btn btn-primary" onClick={openResult}>
             Open workspace →
           </button>
         )}
+        {status === "cancelled" && <span className="pill cancelled"><span className="dot" />Stopped</span>}
         {status === "error" && <span className="pill error"><span className="dot" />Failed</span>}
       </div>
 

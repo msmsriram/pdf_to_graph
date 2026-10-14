@@ -160,6 +160,8 @@ body {
 .pill.complete { background: rgba(52,211,153,0.14); color: var(--ok); }
 .pill.complete .dot { background: var(--ok); }
 .pill.error { background: rgba(248,113,113,0.14); color: var(--err); }
+.pill.cancelled { background: rgba(251,191,36,0.16); color: #b7791f; }
+.pill.cancelled .dot { background: #f59e0b; }
 .pill.error .dot { background: var(--err); }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
 

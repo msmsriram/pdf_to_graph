@@ -105,8 +105,17 @@ async def upload_document(
     storage.create_manifest(document_id, name=doc_name, original_filename=original_filename, sources=sources)
 
     # Kick off background processing (fire and forget; progress via WebSocket).
-    asyncio.create_task(pipeline.process_document(document_id))
+    pipeline.start(document_id)
     return {"document_id": document_id, "name": doc_name, "status": "uploaded", "sources": sources}
+
+
+@app.post("/api/documents/{document_id}/cancel")
+async def cancel_document(document_id: str) -> dict:
+    """Stop processing. Charts extracted so far are kept; returns the document."""
+    if not storage.read_manifest(document_id):
+        raise HTTPException(status_code=404, detail="Document not found")
+    await pipeline.cancel(document_id)
+    return storage.read_manifest(document_id)
 
 
 @app.post("/api/documents/{document_id}/pages/{page_number}/analyze")
@@ -120,7 +129,7 @@ async def analyze_page_override(document_id: str, page_number: int) -> dict:
         raise HTTPException(status_code=404, detail="Page not found")
     if page.get("status") == "analyzed" and page.get("chart_ids"):
         raise HTTPException(status_code=400, detail="This page has already been analyzed.")
-    if m.get("status") not in {"complete", "error"}:
+    if m.get("status") not in {"complete", "error", "cancelled"}:
         raise HTTPException(status_code=409, detail="Document is still processing.")
     try:
         return await pipeline.analyze_page_now(document_id, page_number)

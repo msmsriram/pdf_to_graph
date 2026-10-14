@@ -5,7 +5,7 @@ import { useStore } from "../store.js";
 import { api } from "../lib/api.js";
 
 function StatusPill({ status }) {
-  const label = { uploaded: "Queued", rendering: "Rendering", analyzing: "Analyzing", complete: "Ready", error: "Failed" }[status] || status;
+  const label = { uploaded: "Queued", rendering: "Rendering", analyzing: "Analyzing", complete: "Ready", error: "Failed", cancelled: "Stopped" }[status] || status;
   return (
     <span className={`pill ${status}`}>
       <span className="dot" />
@@ -126,7 +126,7 @@ export default function Home() {
   const openDoc = async (id) => {
     try {
       const doc = await api.getDocument(id);
-      if (doc.status === "complete" || doc.status === "error" || (doc.charts && doc.charts.length)) openWorkspace(doc);
+      if (["complete", "error", "cancelled"].includes(doc.status) || (doc.charts && doc.charts.length)) openWorkspace(doc);
       else startProcessing(doc.document_id, doc.name); // still processing — re-attach to the live feed
     } catch (_) {}
   };

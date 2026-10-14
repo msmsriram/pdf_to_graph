@@ -24,6 +24,8 @@ export const api = {
       })
       .then((r) => r.data);
   },
+  // Stop processing; charts extracted so far are kept. Resolves with the updated document.
+  cancelDocument: (id) => http.post(`/documents/${id}/cancel`).then((r) => r.data),
   // "Process anyway" for a page the gate skipped; resolves with the updated document.
   analyzePage: (docId, pageNumber) => http.post(`/documents/${docId}/pages/${pageNumber}/analyze`).then((r) => r.data),
   saveVersion: (docId, chartId, spec, label) =>
