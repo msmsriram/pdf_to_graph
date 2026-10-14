@@ -73,10 +73,15 @@ Your job:
      (typical for European datasheets, e.g. an English line and a German line under the x-axis),
      or 'none' when nothing is printed (still give a sensible title). Never put axis names or
      in-plot condition text (e.g. 'VDS = 10V') into the title.
-   - x_axis and y_axis: label, unit, scale (linear/log), numeric min/max when visible, and the tick
+   - x_axis and y_axis: label, unit, scale (linear/log), numeric min/max, and the tick
      spacing: major_interval = the step between labelled ticks (0,2,4,… → 2; 0,5,10,… → 5);
      minor_interval = the step of the finer unlabelled gridlines if the plot has them, else null.
      For log axes leave both null (decades are implied).
+     AXIS ENDS: min/max are the values at the EDGES OF THE PLOT AREA (the plot_bbox sides), not the
+     outermost printed tick. When the frame extends past the last labelled tick, extrapolate from
+     the tick spacing — e.g. a log y-axis labelled …, 1, 10 whose frame continues about 0.85 decade
+     above 10 has max ≈ 70. Never leave min/max null when ticks are readable: the reconstruction
+     maps the plot_bbox onto exactly [min, max], so a missing or wrong end squashes the whole chart.
      AXIS DIRECTION: set inverse = true when the printed values DECREASE along the axis direction —
      going UP for the y-axis or going RIGHT for the x-axis. Typical case: a y-axis reading 0 at the
      bottom and -0.2, -0.4 … -1.0 towards the top (PNP transistors, negative quantities). Otherwise

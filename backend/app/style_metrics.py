@@ -31,7 +31,7 @@ from PIL import Image, ImageDraw
 CAP_HEIGHT_RATIO = 0.72  # digit/cap height as a fraction of font size (Arial-like)
 AA_ALLOWANCE = 0.5  # anti-aliasing adds roughly half a pixel of "ink" at our threshold
 # Bump when the method changes: stored metrics with an older version are re-measured on open.
-METRICS_VERSION = 4
+METRICS_VERSION = 5
 
 
 # ----------------------------------------------------------------------------- basics
@@ -291,6 +291,11 @@ def measure(crop_path: Path, plot_rect: Optional[list[float]] = None, spec: Opti
         series_w = [curve_w if w is None else w for w in series_w]
     elif rest is not None and width is not None and rest.any():
         curve_w = max(1.0, float(np.median(width[rest])) - AA_ALLOWANCE)
+    # Sanity: datasheet gridlines are hairlines. A "grid" 3+ px wide and nearly as heavy as the
+    # curves is curve ink that slipped past the band (e.g. the curves were mapped through a wrong
+    # axis range) — drop it; the renderer's default thin grid is far closer than a bold black one.
+    if grid_w is not None and grid_w >= 3 and (curve_w is None or grid_w >= 0.6 * curve_w):
+        grid_w, grid_gray = None, None
     if grid_w is not None and curve_w is not None:
         grid_w = min(grid_w, curve_w)
 

@@ -56,8 +56,8 @@ class Axis(BaseModel):
     label: Optional[str] = None
     unit: Optional[str] = None
     scale: AxisScale = "linear"
-    min: Optional[float] = None
-    max: Optional[float] = None
+    min: Optional[float] = Field(None, description="Value at the plot-area edge (extrapolated from the ticks if unlabelled); null only if no ticks are readable.")
+    max: Optional[float] = Field(None, description="Value at the plot-area edge (extrapolated from the ticks if unlabelled); null only if no ticks are readable.")
     # Direction: True when the values DECREASE going up (y) / going right (x), e.g. a y-axis that
     # reads 0 at the bottom and -1.0 at the top (PNP / negative quantities). min/max stay numeric.
     inverse: bool = Field(False, description="True if axis values decrease along the axis direction (up for y, right for x).")
