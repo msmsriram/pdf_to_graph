@@ -112,14 +112,32 @@ export function specToOption(
   // Gridlines: when the crop was measured, draw them as DARK as the original prints them
   // (grid_gray: 0 = black … 1 = white) and give minor lines the same weight — datasheets
   // print major and minor gridlines alike. Otherwise: visible major, lighter minor.
-  const gridGray = measured && typeof sm.grid_gray === "number" ? Math.min(0.85, Math.max(0, sm.grid_gray)) : null;
+  const series = spec.series || [];
+  let gridGray = measured && typeof sm.grid_gray === "number" ? Math.min(0.85, Math.max(0, sm.grid_gray)) : null;
+  // Grid ink budget: copying the original's dark gridlines is right for a normal grid, but on
+  // dense log paper (≈20 lines per decade on both axes) the same lines ink a third of the plot
+  // and drown curves and text. Estimate the share of the plot the grid would cover
+  // (lines × width × darkness ÷ plot size); above the budget, thin to ≤1 px, then lighten
+  // until it fits. Ordinary grids are well under the budget and are left exactly as measured.
+  let gridLineW = gridW;
+  if (gridGray != null && !isCategorical(spec)) {
+    const plotW = (rect ? rect[2] - rect[0] : 0.8) * width;
+    const plotH = (rect ? rect[3] - rect[1] : 0.75) * height;
+    const nV = gridLineCount(spec.x_axis, series, (p) => p.x);
+    const nH = gridLineCount(spec.y_axis, series, (p) => p.y);
+    const density = plotW > 0 && plotH > 0 ? nV / plotW + nH / plotH : 0; // lines per px
+    const coverage = (w, gray) => density * w * (1 - gray);
+    if (coverage(gridLineW, gridGray) > GRID_INK_BUDGET) {
+      gridLineW = Math.min(gridLineW, 1);
+      if (coverage(gridLineW, gridGray) > GRID_INK_BUDGET) gridGray = Math.min(0.85, 1 - GRID_INK_BUDGET / (density * gridLineW));
+    }
+  }
   const grayCss = gridGray != null ? `rgb(${Math.round(gridGray * 255)},${Math.round(gridGray * 255)},${Math.round(gridGray * 255)})` : null;
   const gridColor = !dark || forExport ? grayCss || (forExport ? "rgba(0,0,0,0.30)" : "rgba(0,0,0,0.22)") : "rgba(255,255,255,0.18)";
   const minorGridColor = !dark || forExport ? grayCss || (forExport ? "rgba(0,0,0,0.13)" : "rgba(0,0,0,0.10)") : "rgba(255,255,255,0.08)";
-  const minorGridW = gridGray != null ? gridW : 1;
+  const minorGridW = gridGray != null ? gridLineW : 1;
   const textColor = forExport ? "#222" : dark ? "#aeb9d4" : "#333";
   const titleColor = forExport ? "#111" : dark ? "#eef2fb" : "#111";
-  const series = spec.series || [];
   const displayName = (se) => (se.conditions ? `${se.name} · ${se.conditions}` : se.name);
   // Subscript fragment style used wherever text may contain X_Y.
   const richFor = (color, base) => ({
@@ -261,7 +279,7 @@ export function specToOption(
       nameGap: xNameOpts.nameGap,
       axisLine: { lineStyle: { color: axisColor, width: gridW } },
       axisLabel: { color: axisColor, fontSize: px(13), fontFamily: FONT },
-      splitLine: { show: showGrid, lineStyle: { color: gridColor, width: gridW } },
+      splitLine: { show: showGrid, lineStyle: { color: gridColor, width: gridLineW } },
       nameTextStyle: { color: textColor, fontSize: px(13), fontFamily: FONT, rich: richFor(textColor, 13), ...xNameOpts.nameTextStyle },
       ...hiddenAxisBits,
     };
@@ -276,7 +294,7 @@ export function specToOption(
       inverse: spec.x_axis?.inverse === true, // values decrease to the right
       axisLine: { lineStyle: { color: axisColor, width: gridW } },
       axisLabel: { color: axisColor, fontSize: px(13), fontFamily: FONT },
-      splitLine: { show: showGrid, lineStyle: { color: gridColor, width: gridW } },
+      splitLine: { show: showGrid, lineStyle: { color: gridColor, width: gridLineW } },
       nameTextStyle: { color: textColor, fontSize: px(13), fontFamily: FONT, rich: richFor(textColor, 13), ...xNameOpts.nameTextStyle },
       ...linearTicks(spec.x_axis, showGrid, minorGridColor, minorGridW),
       ...hiddenAxisBits,
@@ -298,7 +316,7 @@ export function specToOption(
       rich: richFor(axisColor, 13),
       formatter: spec.y_axis?.scale === "log" && yMode !== "side" ? logExpFmt : undefined,
     },
-    splitLine: { show: showGrid, lineStyle: { color: gridColor, width: gridW } },
+    splitLine: { show: showGrid, lineStyle: { color: gridColor, width: gridLineW } },
     nameTextStyle: { color: textColor, fontSize: px(13), fontFamily: FONT, rich: richFor(textColor, 13), ...yNameOpts.nameTextStyle },
     ...linearTicks(spec.y_axis, showGrid, minorGridColor, minorGridW),
     ...hiddenAxisBits,
@@ -466,6 +484,25 @@ export function specToOption(
 
 /* ------------------------------------------------------------------ helpers */
 const OVERLAY_INK = "#e5484d";
+// Max share of the plot area the gridlines may ink (lines × width × darkness ÷ plot size).
+// Typical datasheet grids measure 5–10%; dense log-log paper drawn at its measured darkness ~35%.
+const GRID_INK_BUDGET = 0.12;
+
+// Gridlines the renderer will draw across one axis: decade lines + the 2…9 log-paper lines on a
+// log axis; major (and minor, when given) steps on a linear axis; ~6 when ECharts auto-ticks.
+function gridLineCount(axis, series, getter) {
+  if (axis?.scale === "log") {
+    const ext = axisExtent(axis, series, getter);
+    if (!ext) return 0;
+    const decades = Math.max(0, Math.floor(Math.log10(ext[1]) + 1e-9) - Math.ceil(Math.log10(ext[0]) - 1e-9) + 1);
+    return decades + logPaperLines(ext).length;
+  }
+  const r = axisRange(axis, series, getter);
+  if (!r) return 0;
+  const major = axis?.major_interval, minor = axis?.minor_interval;
+  const step = major > 0 && minor > 0 && minor < major ? minor : major; // linearTicks draws minors only with a major
+  return step > 0 ? Math.floor((r[1] - r[0]) / step + 1e-9) + 1 : 6;
+}
 
 // True for black / gray / white hex colours (no hue to tell them apart from the original's ink).
 function isAchromatic(hex) {
