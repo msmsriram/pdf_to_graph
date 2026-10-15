@@ -232,8 +232,12 @@ export function specToOption(
             ...box,
             textAlign: "left",
             textStyle: { color: textColor, fontSize: px(12), fontWeight: 400, lineHeight: px(16), fontFamily: FONT, rich: richFor(textColor, 12) },
-            backgroundColor: forExport ? "rgba(255,255,255,0.92)" : "transparent",
+            // Opaque box like the original's note boxes: it hides the gridlines behind the text,
+            // and z 1.5 keeps it ABOVE the grid (axis split lines z 0, log-paper series z 1) but
+            // BELOW the curves (z 2), so no plotted line is ever covered by a note.
+            backgroundColor: forExport || !dark ? "#ffffff" : "#0f1524",
             padding: [px(3), px(5)],
+            z: 1.5,
           };
         });
   base.title = [base.title, ...annTitles];

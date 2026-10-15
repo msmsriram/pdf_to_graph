@@ -88,7 +88,9 @@ Your job:
      false. min/max are ALWAYS the numerically smaller/larger end values regardless of direction.
    - series: one per curve. Set `name` to the curve's ON-PLOT label if it is labelled directly
      next to the line (e.g. '6V', '5V', 'VGS=7~10V'); otherwise use its legend name. Include
-     `conditions` (e.g. 'VCE=-1V'), color if readable, and data points. Use x/y for numeric charts
+     `conditions` (e.g. 'VCE=-1V') only when it belongs to THAT curve — never copy a chart-wide
+     note (one that applies to every curve, e.g. 'D=Ton/T; RθJA=32°C/W') into each series; it goes
+     in annotations once. Give color if readable, and data points. Use x/y for numeric charts
      and `label` for bar/pie categories. For each curve also give label_x/label_y = the DATA
      coordinates of the CENTRE of its printed on-plot label (null if the chart uses a legend box),
      and label_boxed = true when that label sits inside a bordered box.
@@ -111,11 +113,15 @@ Your job:
        straight segments (e.g. SOA boundaries).
      * inline_labels = true if each curve is labelled directly on the plot (near its end); false if
        the chart uses a separate legend box.
-     * legend = true ONLY if the original draws a legend box; false when curves are labelled inline.
+     * legend = true ONLY if the original draws a legend box (line samples next to names); false when
+       curves are labelled inline, and false when the curves are only listed in printed text (e.g.
+       'in descending order: D=0.9, 0.7, …') — that text is an annotation, not a legend.
      * show_markers = true ONLY if the original draws visible point markers (dots) on the curves;
        datasheet line charts usually have NONE, so default false.
      * annotations = every in-plot text box (e.g. a 'Note: 1.TA=25C 2.Pulse test' block). Give its
        text (keep line breaks) and its corner position. Do NOT put axis titles or curve labels here.
+       Annotations are PRINTED TEXT only, copied verbatim: never describe a drawing, schematic or
+       inset (e.g. a pulse-train sketch labelled P_D, T_on, T) — it is not reproduced, so skip it.
    - Values you read off a plotted curve are ESTIMATES. Read printed data labels and any
      accompanying table FIRST — those are exact; only estimate from pixels when nothing is printed.
    - bbox: a normalized [x0,y0,x1,y1] (0..1) tightly around the chart, for cropping.
