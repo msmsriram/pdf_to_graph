@@ -9,6 +9,7 @@ export const api = {
   listDocuments: () => http.get("/documents").then((r) => r.data),
   getDocument: (id) => http.get(`/documents/${id}`).then((r) => r.data),
   deleteDocument: (id) => http.delete(`/documents/${id}`).then((r) => r.data),
+  reprocessDocument: (id) => http.post(`/documents/${id}/reprocess`).then((r) => r.data),
   // One upload = one document: an optional PDF plus any number of named images.
   // `images`: [{ file, label }]. The backend turns images into pages after the PDF's.
   uploadBundle: ({ pdf, images = [], name = "" }, onProgress) => {

@@ -65,6 +65,68 @@ connects late still gets every earlier event, then the live stream.
 
 ## 4. What lands on disk
 
+Storage supports two modes. `STORAGE_BACKEND=local` preserves the filesystem
+behavior below. `STORAGE_BACKEND=supabase` keeps document state (including chart
+versions and usage) in Postgres and original PDFs/images, rendered pages and crops
+in a private Supabase Storage bucket. The local directory is then only a cache:
+existing asset URLs restore missing files and verify their SHA-256 hashes.
+
+To configure Supabase, set these **backend-only** environment variables:
+
+```dotenv
+STORAGE_BACKEND=supabase
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SECRET_KEY=your-backend-secret-key
+SUPABASE_BUCKET=pdf-chart-studio
+SUPABASE_TABLE=chart_studio_documents
+STORAGE_DIR=storage
+```
+
+Run `backend/supabase_schema.sql` once in Supabase SQL Editor and create a private
+bucket matching `SUPABASE_BUCKET`. Alternatively, the standalone setup script
+does both and can migrate existing local documents:
+
+```powershell
+pip install "psycopg[binary]"
+python scripts/setup_supabase_storage.py --import-local
+```
+
+The setup script reads `SUPABASE_POOLER_HOST`, `SUPABASE_POOLER_USER` and
+`SUPABASE_DB_PASSWORD` from the ignored `backend/.env`. Database credentials are
+only needed for provisioning; the running app uses HTTPS and the secret API key.
+Run setup from the repository root. The scripts are additive and skip document
+IDs already imported. Incomplete legacy fixtures remain viewable, but cannot
+reprocess when their original sources are missing.
+
+On Render, configure the six runtime variables above on the backend service.
+Keep `OPENAI_API_KEY` configured there as well. Never set the secret key in a
+frontend `VITE_` variable. GitHub repository authorization alone does not configure
+these service environment variables or switch the deployed app to Supabase.
+
+Use **one backend process/instance** for this demo. At startup, abandoned
+in-progress jobs are marked interrupted; they do not automatically resume.
+The homepage's **Reprocess originals** action retrieves the original PDF and/or
+uploaded images, creates a separate result, and starts processing with the current
+model settings. Earlier charts, costs and versions stay intact. Model calls are
+billable; a working `OPENAI_API_KEY` is required. Chart-only re-extraction also
+restores its crop from Supabase if the local cache is empty.
+
+The shared application access model is unchanged: anyone with application access
+can view/edit/delete documents. Buckets and database tables remain private to the
+backend; the backend itself provides the shared application API.
+
+Supabase Storage and the database are separate services: file bytes are not stored
+inside SQL rows. Free-plan file limits apply to each object. Full-page PNGs can
+consume more storage than their original PDFs; deleting a document removes its
+remote objects as well as its database state. Keep independent backups.
+
+Verification scripts under `scripts/` test storage hashes, PDF/image decoding,
+and the actual API against an empty cache. `verify_supabase_integration.py` needs
+`httpx` and uses mocked extraction responses to avoid model charges; file and
+database calls are real. These verification scripts use the current local demo
+fixtures. `python -m unittest discover -s backend/tests` runs isolated regression
+tests without network access.
+
 ```
 backend/storage/
   index.json                      # history
@@ -94,6 +156,6 @@ backend/storage/
   the original crop side-by-side and per-field confidence so you can verify/correct.
 - Chart detection + data extraction are done by the model in one pass (the deterministic
   pixel-tracing digitizer is a planned Phase-2 accuracy upgrade).
-- Single-user, local, no auth. Storage is JSON files on disk.
+- Shared library, no auth. Storage can be local JSON/files or Supabase Postgres/Storage.
 - Supported chart types: line, area, bar (grouped/stacked), scatter, pie.
 ```

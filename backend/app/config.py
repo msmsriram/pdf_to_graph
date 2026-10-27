@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -39,6 +40,11 @@ class Settings(BaseSettings):
 
     # Server / storage
     storage_dir: str = "storage"
+    storage_backend: Literal["local", "supabase"] = "local"
+    supabase_url: str = ""
+    supabase_secret_key: str = ""
+    supabase_bucket: str = "pdf-chart-studio"
+    supabase_table: str = "chart_studio_documents"
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     # Any of these frontends are allowed in addition to the explicit list above.
     # Covers Vercel deploy URLs (which change per deploy) and Render static sites.

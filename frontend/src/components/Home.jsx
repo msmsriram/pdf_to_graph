@@ -28,11 +28,12 @@ export default function Home() {
   const [uploading, setUploading] = useState(false);
   const [uploadPct, setUploadPct] = useState(0);
   const [error, setError] = useState(null);
+  const [reprocessing, setReprocessing] = useState(null);
   const startProcessing = useStore((s) => s.startProcessing);
   const openWorkspace = useStore((s) => s.openWorkspace);
 
   const refresh = useCallback(() => {
-    api.listDocuments().then(setDocs).catch(() => {});
+    api.listDocuments().then(setDocs).catch((e) => setError(e?.response?.data?.detail || "Could not load saved documents"));
   }, []);
   useEffect(() => {
     refresh();
@@ -128,13 +129,34 @@ export default function Home() {
       const doc = await api.getDocument(id);
       if (["complete", "error", "cancelled"].includes(doc.status) || (doc.charts && doc.charts.length)) openWorkspace(doc);
       else startProcessing(doc.document_id, doc.name); // still processing — re-attach to the live feed
-    } catch (_) {}
+    } catch (err) {
+      setError(err?.response?.data?.detail || "Could not open this document");
+    }
   };
 
   const del = async (e, id) => {
     e.stopPropagation();
-    await api.deleteDocument(id);
-    refresh();
+    try {
+      await api.deleteDocument(id);
+      refresh();
+    } catch (err) {
+      setError(err?.response?.data?.detail || "Delete failed");
+    }
+  };
+
+  const reprocess = async (e, id) => {
+    e.stopPropagation();
+    if (!window.confirm("Process the saved original files again? This creates a new result, keeps the previous one, and incurs model usage charges.")) return;
+    setReprocessing(id);
+    setError(null);
+    try {
+      const result = await api.reprocessDocument(id);
+      startProcessing(result.document_id, result.name);
+    } catch (err) {
+      setError(err?.response?.data?.detail || "Reprocessing failed");
+    } finally {
+      setReprocessing(null);
+    }
   };
 
   const summary = [pdf ? "1 PDF" : null, images.length ? `${images.length} image${images.length > 1 ? "s" : ""}` : null].filter(Boolean).join(" + ");
@@ -239,11 +261,24 @@ export default function Home() {
                   <div className="doc-name">{d.name}</div>
                   <StatusPill status={d.status} />
                   <div className="doc-meta">
+                    <span>{d.pdf_count ?? (hasPdf ? 1 : 0)} PDF</span>
                     {hasPdf && <span>📑 {pdfPages} pages</span>}
                     {nImg > 0 && <span>🖼 {nImg} image{nImg > 1 ? "s" : ""}</span>}
                     <span>📊 {d.charts_count} charts</span>
                     {d.pages_skipped > 0 && <span title="Pages the gate found no charts on">⏭ {d.pages_skipped} skipped</span>}
                   </div>
+                  <div className="doc-meta">
+                    {d.finalized_count != null && <span>{d.finalized_count} finalized</span>}
+                    {d.estimated_cost_usd != null && <span title="Estimated model cost including screening and reruns">{d.pricing_complete ? "Est. " : "Known cost "}${Number(d.estimated_cost_usd).toFixed(4)}</span>}
+                    {Object.entries(d.chart_types || {}).map(([type, count]) => <span key={type}>{count} {type}</span>)}
+                  </div>
+                  {d.source_files_available === false ? (
+                    <div className="muted" style={{ marginTop: 10 }}>Original source missing; upload it again to reprocess.</div>
+                  ) : !["uploaded", "rendering", "analyzing"].includes(d.status) && (
+                    <button className="btn btn-sm" style={{ marginTop: 10 }} disabled={reprocessing != null} onClick={(e) => reprocess(e, d.document_id)}>
+                      {reprocessing === d.document_id ? "Preparing…" : "Reprocess originals"}
+                    </button>
+                  )}
                   {nImg > 0 && (
                     <div className="doc-images">
                       {srcs.filter((s) => s.kind === "image").map((s, i) => (

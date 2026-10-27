@@ -11,6 +11,8 @@ import json
 import sys
 import time
 import uuid
+import shutil
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 if __package__ in {None, ""}:
@@ -19,9 +21,9 @@ if __package__ in {None, ""}:
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
 
-from . import costs, pipeline, storage, style_metrics
+from . import costs, pipeline, storage, style_metrics, supabase_storage
 from .config import get_settings
 from .events import bus
 from .openai_client import extract_single_chart
@@ -30,7 +32,21 @@ from .schemas import RerunRequest, SaveVersionRequest
 REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max"}
 
 settings = get_settings()
-app = FastAPI(title="PDF Chart Studio API", version="1.0.0")
+
+
+@asynccontextmanager
+async def lifespan(app):
+    await asyncio.to_thread(storage.mark_interrupted)
+    yield
+
+
+app = FastAPI(title="PDF Chart Studio API", version="1.0.0", lifespan=lifespan)
+
+
+@app.exception_handler(supabase_storage.StorageError)
+async def storage_error(request, exc):
+    return JSONResponse(status_code=409 if isinstance(exc, supabase_storage.StorageConflict) else 503,
+                        content={"detail": str(exc)})
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,8 +57,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve rendered pages / chart crops.
-app.mount("/storage", StaticFiles(directory=str(settings.storage_path)), name="storage")
+# Keep existing URLs; a fresh instance restores assets from the private bucket.
+@app.get("/storage/{document_id}/{relative:path}")
+def stored_asset(document_id: str, relative: str):
+    try:
+        return FileResponse(storage.asset_path(document_id, relative))
+    except (FileNotFoundError, ValueError):
+        raise HTTPException(status_code=404, detail="Asset not found")
 
 
 @app.get("/api/health")
@@ -52,6 +73,7 @@ async def health() -> dict:
         "model": settings.openai_model,
         "gate_model": settings.gate_model if settings.gate_enabled else None,
         "has_key": bool(settings.openai_api_key),
+        "storage_backend": settings.storage_backend,
     }
 
 
@@ -102,26 +124,59 @@ async def upload_document(
 
     doc_name = name.strip() or (Path(pdfs[0].filename).stem if pdfs else sources[0]["label"])
     original_filename = pdfs[0].filename if pdfs else (images[0].filename or "images")
-    storage.create_manifest(document_id, name=doc_name, original_filename=original_filename, sources=sources)
+    await asyncio.to_thread(storage.create_manifest, document_id, name=doc_name, original_filename=original_filename, sources=sources)
 
     # Kick off background processing (fire and forget; progress via WebSocket).
     pipeline.start(document_id)
     return {"document_id": document_id, "name": doc_name, "status": "uploaded", "sources": sources}
 
 
+def prepare_reprocess(document_id: str) -> dict:
+    """Copy exact saved originals into a NEW run, retaining old charts and costs."""
+    m = storage.read_manifest(document_id)
+    if not m:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if m.get("status") in {"uploaded", "rendering", "analyzing"}:
+        raise HTTPException(status_code=409, detail="Wait for processing to finish or stop it first")
+    try:
+        originals = storage.source_paths(document_id, m)
+    except FileNotFoundError:
+        raise HTTPException(status_code=409, detail="An original source file is missing; upload it again to reprocess")
+    if not originals:
+        raise HTTPException(status_code=409, detail="No original sources are available; upload them again")
+    new_id = uuid.uuid4().hex[:12]
+    for relative, src in originals:
+        destination = storage.doc_dir(new_id) / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, destination)
+    new = storage.create_manifest(new_id, m["name"] + " · reprocessed", m["original_filename"], m.get("sources"))
+    new["reprocessed_from"] = document_id
+    storage.write_manifest(new)
+    return {"document_id": new_id, "name": new["name"], "status": "uploaded"}
+
+
+@app.post("/api/documents/{document_id}/reprocess")
+async def reprocess_document(document_id: str) -> dict:
+    if not settings.openai_api_key:
+        raise HTTPException(status_code=503, detail="Set OPENAI_API_KEY on the backend before reprocessing")
+    result = await asyncio.to_thread(prepare_reprocess, document_id)
+    pipeline.start(result["document_id"])
+    return result
+
+
 @app.post("/api/documents/{document_id}/cancel")
 async def cancel_document(document_id: str) -> dict:
     """Stop processing. Charts extracted so far are kept; returns the document."""
-    if not storage.read_manifest(document_id):
+    if not await asyncio.to_thread(storage.read_manifest, document_id):
         raise HTTPException(status_code=404, detail="Document not found")
     await pipeline.cancel(document_id)
-    return storage.read_manifest(document_id)
+    return await asyncio.to_thread(storage.read_manifest, document_id)
 
 
 @app.post("/api/documents/{document_id}/pages/{page_number}/analyze")
 async def analyze_page_override(document_id: str, page_number: int) -> dict:
     """'Process anyway': run the extraction model on a page the gate skipped. Returns the document."""
-    m = storage.read_manifest(document_id)
+    m = await asyncio.to_thread(storage.read_manifest, document_id)
     if not m:
         raise HTTPException(status_code=404, detail="Document not found")
     page = next((p for p in m.get("pages", []) if p.get("page_number") == page_number), None)
@@ -141,13 +196,13 @@ async def analyze_page_override(document_id: str, page_number: int) -> dict:
 # History + detail
 # --------------------------------------------------------------------------- #
 @app.get("/api/documents")
-async def list_documents() -> list[dict]:
+def list_documents() -> list[dict]:
     return storage.read_index()
 
 
 @app.get("/api/documents/{document_id}")
 async def get_document(document_id: str) -> dict:
-    m = storage.read_manifest(document_id)
+    m = await asyncio.to_thread(storage.read_manifest, document_id)
     if not m:
         raise HTTPException(status_code=404, detail="Document not found")
     # Charts extracted before stroke/text measurement existed get measured on first open;
@@ -155,7 +210,7 @@ async def get_document(document_id: str) -> dict:
     changed = await asyncio.to_thread(_ensure_style_metrics, m, document_id)
     changed = costs.refresh_pricing(m) or changed
     if changed:
-        storage.write_manifest(m)
+        await asyncio.to_thread(storage.write_manifest, m)
     return m
 
 
@@ -172,8 +227,9 @@ def _ensure_style_metrics(m: dict, document_id: str) -> bool:
         versions = chart.get("versions", [])
         if not any(stale(v.get("spec", {})) for v in versions):
             continue
-        crop = storage.doc_dir(document_id) / chart["crop_image"]
-        if not crop.exists():
+        try:
+            crop = storage.asset_path(document_id, chart["crop_image"])
+        except FileNotFoundError:
             continue
         cur = versions[chart.get("current_version", 0)]["spec"] if versions else {}
         metrics = style_metrics.measure(crop, cur.get("plot_rect"), cur)
@@ -188,7 +244,8 @@ def _ensure_style_metrics(m: dict, document_id: str) -> bool:
 
 @app.delete("/api/documents/{document_id}")
 async def delete_document(document_id: str) -> dict:
-    storage.delete_document(document_id)
+    await pipeline.cancel(document_id)
+    await asyncio.to_thread(storage.delete_document, document_id)
     bus.clear(document_id)
     return {"deleted": True}
 
@@ -197,7 +254,7 @@ async def delete_document(document_id: str) -> dict:
 # Chart version editing
 # --------------------------------------------------------------------------- #
 @app.post("/api/documents/{document_id}/charts/{chart_id}/versions")
-async def save_version(document_id: str, chart_id: str, body: SaveVersionRequest) -> dict:
+def save_version(document_id: str, chart_id: str, body: SaveVersionRequest) -> dict:
     try:
         chart = storage.add_version(
             document_id, chart_id, body.spec.model_dump(), label=body.label or "", kind="edit"
@@ -208,7 +265,7 @@ async def save_version(document_id: str, chart_id: str, body: SaveVersionRequest
 
 
 @app.post("/api/documents/{document_id}/charts/{chart_id}/revert")
-async def revert_version(document_id: str, chart_id: str) -> dict:
+def revert_version(document_id: str, chart_id: str) -> dict:
     """Step back one version (undo). Never deletes; just moves the pointer."""
     m = storage.read_manifest(document_id)
     if not m:
@@ -221,7 +278,7 @@ async def revert_version(document_id: str, chart_id: str) -> dict:
 
 
 @app.post("/api/documents/{document_id}/charts/{chart_id}/set-version/{version}")
-async def set_version(document_id: str, chart_id: str, version: int) -> dict:
+def set_version(document_id: str, chart_id: str, version: int) -> dict:
     try:
         return storage.set_current_version(document_id, chart_id, version)
     except KeyError:
@@ -231,7 +288,7 @@ async def set_version(document_id: str, chart_id: str, version: int) -> dict:
 
 
 @app.post("/api/documents/{document_id}/charts/{chart_id}/finalize")
-async def finalize(document_id: str, chart_id: str) -> dict:
+def finalize(document_id: str, chart_id: str) -> dict:
     try:
         return storage.finalize_chart(document_id, chart_id)
     except KeyError:
@@ -242,7 +299,7 @@ async def finalize(document_id: str, chart_id: str) -> dict:
 async def rerun_chart(document_id: str, chart_id: str, body: RerunRequest) -> dict:
     """Re-extract ONE chart from its crop (optionally at a higher reasoning effort /
     different model) and append the result as a new version. v0 is never touched."""
-    m = storage.read_manifest(document_id)
+    m = await asyncio.to_thread(storage.read_manifest, document_id)
     if not m:
         raise HTTPException(status_code=404, detail="Document not found")
     chart = storage.find_chart(m, chart_id)
@@ -251,8 +308,9 @@ async def rerun_chart(document_id: str, chart_id: str, body: RerunRequest) -> di
     if body.effort and body.effort not in REASONING_EFFORTS:
         raise HTTPException(status_code=400, detail=f"effort must be one of {sorted(REASONING_EFFORTS)}")
 
-    crop = storage.doc_dir(document_id) / chart["crop_image"]
-    if not crop.exists():
+    try:
+        crop = await asyncio.to_thread(storage.asset_path, document_id, chart["crop_image"])
+    except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Chart crop image is missing")
 
     prior = chart["versions"][chart["current_version"]]["spec"]
@@ -266,7 +324,7 @@ async def rerun_chart(document_id: str, chart_id: str, body: RerunRequest) -> di
 
     spec = pipeline._spec_from_extracted(ec)
     spec["style_metrics"] = await asyncio.to_thread(style_metrics.measure, crop, spec.get("plot_rect"), spec)
-    chart_out = storage.add_version(
+    chart_out = await asyncio.to_thread(storage.add_version,
         document_id,
         chart_id,
         spec,
@@ -276,11 +334,11 @@ async def rerun_chart(document_id: str, chart_id: str, body: RerunRequest) -> di
     )
 
     # Document-level accounting: list the re-run and add it to the totals.
-    m2 = storage.read_manifest(document_id)
+    m2 = await asyncio.to_thread(storage.read_manifest, document_id)
     ublock = costs.ensure_usage_block(m2, settings.openai_model)
     ublock["reruns"].append({"chart_id": chart_id, "version": chart_out["current_version"], "at": storage._now(), **usage})
     costs.add_to_totals(ublock["totals"], usage)
-    storage.write_manifest(m2)
+    await asyncio.to_thread(storage.write_manifest, m2)
     return chart_out
 
 
