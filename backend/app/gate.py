@@ -15,7 +15,7 @@ from pathlib import Path
 from PIL import Image
 
 from .config import get_settings
-from .openai_client import _get_client, _usage_from
+from .openai_client import _get_client, _usage_from, _parse_with_headers
 from .schemas import GateResult
 
 GATE_PROMPT = (
@@ -37,16 +37,16 @@ def _small_png_b64(path: Path, max_side: int = 1024) -> str:
 
 
 def _zero_usage(model: str, effort: str) -> dict:
-    return {"model": model, "effort": effort, "input_tokens": 0, "cached_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0, "total_tokens": 0}
+    return {"model": model, "effort": effort, "input_tokens": 0, "cached_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0, "total_tokens": 0, "usage_available": False}
 
 
 def classify_page(page_png: Path) -> tuple[GateResult, dict]:
     """Returns (verdict, usage). Never raises — fails open."""
     s = get_settings()
     try:
-        client = _get_client()
+        client = _get_client().with_options(timeout=s.gate_timeout_seconds, max_retries=2)
         b64 = _small_png_b64(page_png)
-        resp = client.responses.parse(
+        resp, limits = _parse_with_headers(client,
             model=s.gate_model,
             reasoning={"effort": s.gate_reasoning},
             input=[
@@ -61,6 +61,7 @@ def classify_page(page_png: Path) -> tuple[GateResult, dict]:
             text_format=GateResult,
         )
         usage = _usage_from(resp, s.gate_model, s.gate_reasoning)
+        usage["rate_limits"] = limits
         parsed = resp.output_parsed
         if parsed is None:
             return GateResult(has_charts=True, chart_count=0, confidence=0.0, reason="Gate returned no answer; passing page through."), usage
@@ -75,4 +76,6 @@ def classify_page(page_png: Path) -> tuple[GateResult, dict]:
 
 def chart_probability(g: GateResult) -> float:
     """P(page has charts) from the verdict + its confidence."""
+    if g.has_charts and g.confidence == 0:
+        return 0.5  # A gate failure/no answer is uncertainty, never evidence to skip.
     return g.confidence if g.has_charts else 1.0 - g.confidence

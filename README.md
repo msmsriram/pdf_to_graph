@@ -127,6 +127,43 @@ database calls are real. These verification scripts use the current local demo
 fixtures. `python -m unittest discover -s backend/tests` runs isolated regression
 tests without network access.
 
+Processing uses windows of five pages by default. Each page is screened, then
+extracted when needed, independently of the other pages in that window. Results
+appear as soon as each page is saved and sort by PDF page and chart number.
+The next window starts after the current window finishes. All page calls share
+one bounded native-text document context instead of depending on the preceding
+page's model response. Scanned PDFs may have no native text context.
+
+`PAGE_BATCH_SIZE`, `GATE_CONCURRENCY`, `EXTRACTION_CONCURRENCY` and
+`LLM_CONCURRENCY` default to `5`. The last setting is a global per-process ceiling
+across documents and both stages, so two stage limits of five do not create ten
+simultaneous calls. Settings accept 1–20 as an application guardrail; this is not
+an OpenAI account entitlement. Actual safe throughput depends on model/project
+request and token limits. The SDK retries eligible transient errors with backoff;
+successful calls retain their rate-limit response headers in the saved usage.
+Extraction requests allow `OPENAI_TIMEOUT_SECONDS=900` by default; screening
+uses `GATE_TIMEOUT_SECONDS=60` per attempt. SDK retry counts flag cases where
+earlier attempts may have incurred usage that was never returned. Cost estimates
+for such runs are explicitly incomplete.
+Cancelled synchronous requests retain their concurrency slots until they finish.
+One failed page retains successful sibling results and marks the document partial
+failure. This uses regular Responses calls, not OpenAI's offline Batch API.
+
+Live events carry a stream id and increasing sequence. Reconnects request only
+new events; the frontend also ignores already-seen events. Heartbeats keep long
+model requests from leaving the socket idle, and a new server supplies a persisted
+snapshot. The homepage removes deleted cards immediately and restores them if
+remote deletion fails. Missing model prices display as unknown; GPT-6.1 Sol's
+Standard rates are included, and old unknown costs are recomputed from saved
+tokens when a document is opened. Cost figures remain estimates, not invoices.
+
+Run frontend regressions with `node --test frontend/tests/*.test.js`.
+`scripts/test_live_parallel_pdf.py` uploads exactly one existing local three-page
+PDF through the upload handler and uses real billable model calls. It retains
+the resulting cloud document and writes a proof report with actual concurrency,
+per-page costs, completion order and rate-limit headers. It does not perform a
+second sequential run for comparison.
+
 ```
 backend/storage/
   index.json                      # history

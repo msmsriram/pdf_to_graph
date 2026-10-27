@@ -6,7 +6,7 @@ import { useStore } from "../store.js";
 // (per page verdict) shown separately so the gate's saving is visible. Live during
 // processing (WebSocket `usage` events), persisted in the manifest afterwards.
 // Figures are the API's billed token counts × the model's list price (standard tier).
-const usd = (v) => `$${(Number(v) || 0).toFixed(4)}`;
+const usd = (v) => v == null ? "Unknown" : `$${Number(v).toFixed(6)}`;
 const int = (v) => (Number(v) || 0).toLocaleString();
 const secs = (v) => `${(Number(v) || 0).toFixed(1)}s`;
 const rate = (p) => (p && p.known ? `$${p.input} in · $${p.cached_input} cached · $${p.output} out / 1M` : "pricing not set (set PRICING_JSON)");
@@ -27,7 +27,7 @@ export default function CostSidebar() {
   const gate = live.gate || (docUsage && docUsage.gate) || null;
   const gateTotals = gate && gate.totals;
   const grand = (totals ? Number(totals.cost_usd) || 0 : 0) + (gateTotals ? Number(gateTotals.cost_usd) || 0 : 0);
-  const anyUnknown = (pricing && !pricing.known) || (gate && gate.pricing && !gate.pricing.known);
+  const anyUnknown = (pricing && !pricing.known) || (gate && gate.pricing && !gate.pricing.known) || totals?.unpriced_calls > 0 || gateTotals?.unpriced_calls > 0 || totals?.uncertain_calls > 0 || gateTotals?.uncertain_calls > 0;
 
   // Per-page rows: the manifest's pages, overlaid with live events while processing.
   const pages = (document && document.pages) || [];
@@ -58,15 +58,16 @@ export default function CostSidebar() {
 
       <div className="card" style={{ padding: 14 }}>
         <div className="muted" style={{ marginBottom: 4 }}>Total for this document</div>
-        <div className="cost-big">{totals || gateTotals ? usd(grand) : "—"}</div>
-        {anyUnknown && <div className="muted" style={{ color: "var(--warn)" }}>One model has no price set; its tokens are counted but cost as $0.</div>}
+        <div className="cost-big">{totals || gateTotals ? `${anyUnknown ? "Known subtotal " : ""}${usd(grand)}` : "—"}</div>
+        {anyUnknown && <div className="muted" style={{ color: "var(--warn)" }}>Some pricing or usage is unavailable. The subtotal includes known costs only.</div>}
+        {(totals?.uncertain_calls > 0 || gateTotals?.uncertain_calls > 0) && <div className="muted" style={{ color: "var(--warn)" }}>Requests were retried. Earlier attempts may have incurred additional usage that was not returned.</div>}
         {!totals && !gateTotals && <div className="muted" style={{ marginTop: 8 }}>No usage recorded yet — figures appear as each page is processed.</div>}
 
         {totals && (
           <>
             <div className="cost-sub">
               <span>Extraction · <span className="mono">{model}</span></span>
-              <b>{usd(totals.cost_usd)}</b>
+              <b>{pricing?.known ? usd(totals.cost_usd) : "Unknown"}</b>
             </div>
             <div className="muted" style={{ fontSize: 11 }}>{rate(pricing)}</div>
             <div className="cost-grid">
@@ -83,7 +84,7 @@ export default function CostSidebar() {
           <>
             <div className="cost-sub" style={{ marginTop: 12 }}>
               <span>Chart gate · <span className="mono">{gate.model}</span></span>
-              <b>{usd(gateTotals.cost_usd)}</b>
+              <b>{gate.pricing?.known ? usd(gateTotals.cost_usd) : "Unknown"}</b>
             </div>
             <div className="muted" style={{ fontSize: 11 }}>{rate(gate.pricing)}</div>
             <div className="cost-grid">
@@ -109,7 +110,8 @@ export default function CostSidebar() {
               const v = r.verdict;
               const gateCell = !r.g ? "—" : v && v.skipped ? "skip" : v && v.overridden ? "forced" : v ? `${v.chart_count} ✓` : "✓";
               const gateTitle = v ? `${v.reason || ""} (P(charts) ${Math.round((v.p_charts ?? 0) * 100)}%)` : "";
-              const cost = (r.u ? Number(r.u.cost_usd) || 0 : 0) + (r.g ? Number(r.g.cost_usd) || 0 : 0);
+              const known = (!r.u || (pricing?.known && r.u.cost_usd != null)) && (!r.g || (gate?.pricing?.known && r.g.cost_usd != null));
+              const cost = known ? (Number(r.u?.cost_usd) || 0) + (Number(r.g?.cost_usd) || 0) : null;
               return (
                 <tr key={r.n} className={v && v.skipped ? "muted" : ""}>
                   <td title={r.label}>{r.label.length > 14 ? `${r.label.slice(0, 13)}…` : r.label}</td>

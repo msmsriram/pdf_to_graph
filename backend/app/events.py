@@ -11,6 +11,8 @@ await between them is atomic (no lost/duplicated events).
 from __future__ import annotations
 
 import asyncio
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -18,6 +20,8 @@ class EventBus:
     def __init__(self) -> None:
         self._subscribers: dict[str, list[asyncio.Queue]] = {}
         self._backlog: dict[str, list[dict[str, Any]]] = {}
+        self.stream_id = uuid.uuid4().hex
+        self._sequence: dict[str, int] = {}
 
     def get_backlog(self, document_id: str) -> list[dict[str, Any]]:
         return list(self._backlog.get(document_id, []))
@@ -35,6 +39,11 @@ class EventBus:
             self._subscribers.pop(document_id, None)
 
     async def publish(self, document_id: str, event: dict[str, Any]) -> None:
+        sequence = self._sequence.get(document_id, 0) + 1
+        self._sequence[document_id] = sequence
+        event = {**event, "stream_id": self.stream_id, "sequence": sequence,
+                 "event_id": f"{self.stream_id}:{document_id}:{sequence}",
+                 "at": datetime.now(timezone.utc).isoformat()}
         self._backlog.setdefault(document_id, []).append(event)
         for q in list(self._subscribers.get(document_id, [])):
             q.put_nowait(event)
@@ -43,6 +52,7 @@ class EventBus:
 
     def clear(self, document_id: str) -> None:
         self._backlog.pop(document_id, None)
+        self._sequence.pop(document_id, None)
         self._subscribers.pop(document_id, None)
 
 

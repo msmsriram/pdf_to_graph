@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
 
 # backend/ directory (parent of app/)
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -23,6 +24,7 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-6-astra"
     reasoning_effort: str = "high"
     image_detail: str = "original"
+    openai_timeout_seconds: float = Field(default=900, gt=0)
 
     # Chart gate: a cheap vision model screens each PDF page before the expensive
     # extraction model sees it. A page is skipped only when the gate is confident there
@@ -33,10 +35,15 @@ class Settings(BaseSettings):
     gate_image_detail: str = "low"
     gate_threshold: float = 0.3
     gate_images: bool = False  # uploaded images are explicit user intent: no gate by default
+    gate_timeout_seconds: float = Field(default=60, gt=0)
 
     # Rendering
     render_dpi: int = 180
     max_pages: int = 40
+    page_batch_size: int = Field(default=5, ge=1, le=20)
+    llm_concurrency: int = Field(default=5, ge=1, le=20)
+    gate_concurrency: int = Field(default=5, ge=1, le=20)
+    extraction_concurrency: int = Field(default=5, ge=1, le=20)
 
     # Server / storage
     storage_dir: str = "storage"

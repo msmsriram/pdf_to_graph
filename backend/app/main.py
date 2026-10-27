@@ -316,10 +316,10 @@ async def rerun_chart(document_id: str, chart_id: str, body: RerunRequest) -> di
     prior = chart["versions"][chart["current_version"]]["spec"]
     t0 = time.perf_counter()
     try:
-        ec, usage = await asyncio.to_thread(extract_single_chart, crop, prior, body.effort, body.model)
+        ec, usage = await pipeline._model_call("extract", extract_single_chart, crop, prior, body.effort, body.model)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Re-extraction failed: {exc}")
-    usage["seconds"] = round(time.perf_counter() - t0, 2)
+    usage.setdefault("seconds", round(time.perf_counter() - t0, 2))
     usage["cost_usd"] = costs.cost_usd(usage, costs.pricing_for(usage["model"]))
 
     spec = pipeline._spec_from_extracted(ec)
@@ -348,15 +348,30 @@ async def rerun_chart(document_id: str, chart_id: str, body: RerunRequest) -> di
 @app.websocket("/ws/documents/{document_id}")
 async def ws_documents(websocket: WebSocket, document_id: str) -> None:
     await websocket.accept()
+    snapshot = None
+    if not bus.get_backlog(document_id):
+        snapshot = await asyncio.to_thread(storage.read_manifest, document_id)
     # Atomic (no await between): snapshot backlog, then subscribe to future events.
     backlog = bus.get_backlog(document_id)
+    stream = websocket.query_params.get("stream")
+    try:
+        after = int(websocket.query_params.get("after", "0"))
+    except ValueError:
+        after = 0
+    if stream == bus.stream_id:
+        backlog = [event for event in backlog if event["sequence"] > after]
     queue = bus.subscribe(document_id)
     try:
+        if snapshot:
+            await websocket.send_json({"type": "snapshot", "document_id": document_id, "document": snapshot})
         for event in backlog:
             await websocket.send_json(event)
         while True:
-            event = await queue.get()
-            await websocket.send_json(event)
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=20)
+                await websocket.send_json(event)
+            except asyncio.TimeoutError:
+                await websocket.send_json({"type": "heartbeat", "document_id": document_id})
     except WebSocketDisconnect:
         pass
     except Exception:  # noqa: BLE001

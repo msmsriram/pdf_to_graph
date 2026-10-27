@@ -9,7 +9,7 @@ Prices are USD per 1M tokens on the standard tier.
   {"gpt-5.4-mini": {"input": 0.4, "cached_input": 0.04, "output": 1.6}}
 - PRICE_INPUT_PER_M / PRICE_CACHED_INPUT_PER_M / PRICE_OUTPUT_PER_M apply only to
   models that are not in the table or PRICING_JSON (a generic fallback).
-Unknown models report known=False: tokens are still counted, cost shows as 0.
+Unknown models report known=False: tokens are still counted, cost is unknown.
 """
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ import os
 from typing import Any
 
 PRICING: dict[str, dict[str, float]] = {
+    # Official Standard rates verified 2026-10-28; USD / 1M tokens.
+    "gpt-6.1-sol": {"input": 2.0, "cached_input": 0.1, "output": 10.0},
     "gpt-6-astra": {"input": 10.0, "cached_input": 1.0, "output": 50.0},
     "gpt-5.6-sol": {"input": 5.0, "cached_input": 0.5, "output": 30.0},
     # gate model (OpenAI list price, standard tier)
@@ -57,7 +59,9 @@ def pricing_for(model: str) -> dict[str, Any]:
     return p
 
 
-def cost_usd(usage: dict[str, Any], pricing: dict[str, Any]) -> float:
+def cost_usd(usage: dict[str, Any], pricing: dict[str, Any]) -> float | None:
+    if not pricing.get("known") or usage.get("usage_available") is False:
+        return None
     inp = int(usage.get("input_tokens") or 0)
     cached = min(int(usage.get("cached_tokens") or 0), inp)
     out = int(usage.get("output_tokens") or 0)
@@ -68,11 +72,13 @@ def cost_usd(usage: dict[str, Any], pricing: dict[str, Any]) -> float:
 
 
 def empty_totals() -> dict[str, Any]:
-    return {"calls": 0, "input_tokens": 0, "cached_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0, "total_tokens": 0, "seconds": 0.0, "cost_usd": 0.0}
+    return {"calls": 0, "unpriced_calls": 0, "uncertain_calls": 0, "input_tokens": 0, "cached_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0, "total_tokens": 0, "seconds": 0.0, "cost_usd": 0.0}
 
 
 def add_to_totals(totals: dict[str, Any], usage: dict[str, Any]) -> dict[str, Any]:
     totals["calls"] = int(totals.get("calls", 0)) + 1
+    totals["unpriced_calls"] = int(totals.get("unpriced_calls", 0)) + int(usage.get("cost_usd") is None)
+    totals["uncertain_calls"] = int(totals.get("uncertain_calls", 0)) + int(usage.get("billing_complete") is False)
     for k in ("input_tokens", "cached_tokens", "output_tokens", "reasoning_tokens", "total_tokens"):
         totals[k] = int(totals.get(k, 0)) + int(usage.get(k) or 0)
     totals["seconds"] = round(float(totals.get("seconds", 0.0)) + float(usage.get("seconds") or 0.0), 2)

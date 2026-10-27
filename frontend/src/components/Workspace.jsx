@@ -41,6 +41,7 @@ function PagesPanel({ document, compact }) {
               ? `${n} chart${n === 1 ? "" : "s"}${g && g.overridden ? " · forced" : ""}`
               : p.status === "pending"
                 ? "pending"
+                : p.status === "error" ? "failed — retry available"
                 : "";
           return (
             <div key={p.page_number} className={`page-row ${p.status || ""}`} title={g ? `${g.reason || ""}` : ""}>
@@ -49,7 +50,7 @@ function PagesPanel({ document, compact }) {
                 {p.label || `Page ${p.page_number}`}
               </span>
               <span className="m">{state}</span>
-              {skipped && (
+              {(skipped || p.status === "error") && (
                 <button className="btn btn-sm" disabled={busy != null} onClick={() => force(p.page_number)} title="Run the extraction model on this page anyway">
                   {busy === p.page_number ? "Reading…" : "Process anyway"}
                 </button>

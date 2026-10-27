@@ -1,5 +1,8 @@
 import { create } from "zustand";
 
+export const orderCharts = (charts) => [...charts].sort((a, b) =>
+  (a.page_number - b.page_number) || a.chart_id.localeCompare(b.chart_id, undefined, { numeric: true }));
+
 const initialTheme =
   (typeof localStorage !== "undefined" && localStorage.getItem("pcs-theme")) || "light";
 
@@ -33,6 +36,7 @@ export const useStore = create((set, get) => ({
   status: null,
   statusMessage: "",
   logs: [],
+  eventCursor: null,
   selectedChartId: null,
   // Token/cost accounting streamed during processing (per page + running totals).
   usageLive: null,
@@ -56,7 +60,7 @@ export const useStore = create((set, get) => ({
   },
 
   goHome: () =>
-    set({ view: "home", documentId: null, document: null, liveCharts: [], logs: [], selectedChartId: null, usageLive: null, costOpen: false }),
+    set({ view: "home", documentId: null, document: null, liveCharts: [], logs: [], eventCursor: null, selectedChartId: null, usageLive: null, costOpen: false }),
 
   startProcessing: (documentId, name) =>
     set({
@@ -68,6 +72,7 @@ export const useStore = create((set, get) => ({
       status: "uploaded",
       statusMessage: "Uploaded, starting…",
       logs: [],
+      eventCursor: null,
       usageLive: null,
     }),
 
@@ -76,14 +81,32 @@ export const useStore = create((set, get) => ({
       view: "workspace",
       documentId: doc.document_id,
       document: doc,
-      liveCharts: doc.charts || [],
+      liveCharts: orderCharts(doc.charts || []),
       selectedChartId: (doc.charts && doc.charts[0]?.chart_id) || null,
       status: doc.status,
     }),
 
   handleEvent: (ev) => {
     const s = get();
+    if (ev.document_id && ev.document_id !== s.documentId) return false;
+    if (ev.sequence && ev.stream_id) {
+      if (s.eventCursor?.stream_id === ev.stream_id && ev.sequence <= s.eventCursor.sequence) return false;
+      set({ eventCursor: { stream_id: ev.stream_id, sequence: ev.sequence } });
+    }
     switch (ev.type) {
+      case "snapshot":
+        set({ document: ev.document, liveCharts: orderCharts(ev.document.charts || []),
+          progress: ev.document.progress, status: ev.document.status, statusMessage: ev.document.status_message,
+          usageLive: null });
+        break;
+      case "page_rendered": {
+        const doc = s.document || {};
+        const pages = [...(doc.pages || []).filter((p) => p.page_number !== ev.page_number),
+          { page_number: ev.page_number, label: ev.label, kind: ev.kind, image: ev.image }]
+          .sort((a, b) => a.page_number - b.page_number);
+        set({ document: { ...doc, pages } });
+        break;
+      }
       case "status":
         set({ status: ev.status, statusMessage: ev.message });
         break;
@@ -91,18 +114,21 @@ export const useStore = create((set, get) => ({
         set({ progress: ev.progress });
         break;
       case "log":
-        set({ logs: [...s.logs.slice(-80), { level: ev.level, message: ev.message, t: Date.now() }] });
+        set({ logs: [...s.logs.slice(-80), { level: ev.level, message: ev.message, t: ev.at || Date.now() }] });
         break;
       case "chart_extracted":
-        set({ liveCharts: [...s.liveCharts.filter((c) => c.chart_id !== ev.chart.chart_id), ev.chart] });
+        set({ liveCharts: orderCharts([...s.liveCharts.filter((c) => c.chart_id !== ev.chart.chart_id), ev.chart]) });
         break;
       case "usage": {
         const prev = s.usageLive || {};
+        const document = s.document ? { ...s.document, pages: (s.document.pages || []).map((p) => p.page_number !== ev.page_number ? p :
+          ev.scope === "gate" ? { ...p, gate: ev.verdict || p.gate, status: ev.verdict?.skipped ? "skipped" : p.status } :
+          { ...p, usage: ev.usage, status: "analyzed" }) } : s.document;
         if (ev.scope === "gate") {
           const g = prev.gate || {};
-          set({ usageLive: { ...prev, gate: { model: ev.model, pricing: ev.pricing, totals: ev.totals, pages: { ...(g.pages || {}), [ev.page_number]: ev.usage } } } });
+          set({ document, usageLive: { ...prev, gate: { model: ev.model, pricing: ev.pricing, totals: ev.totals, pages: { ...(g.pages || {}), [ev.page_number]: ev.usage } } } });
         } else {
-          set({ usageLive: { ...prev, model: ev.model, pricing: ev.pricing, totals: ev.totals, pages: { ...(prev.pages || {}), [ev.page_number]: ev.usage } } });
+          set({ document, usageLive: { ...prev, model: ev.model, pricing: ev.pricing, totals: ev.totals, pages: { ...(prev.pages || {}), [ev.page_number]: ev.usage } } });
         }
         break;
       }
@@ -117,7 +143,8 @@ export const useStore = create((set, get) => ({
     }
   },
 
-  setDocument: (doc) => set({ document: doc, liveCharts: doc.charts || [] }),
+  setDocument: (doc) => set({ document: doc, liveCharts: orderCharts(doc.charts || []),
+    progress: doc.progress, status: doc.status, statusMessage: doc.status_message }),
   selectChart: (id) => set({ selectedChartId: id }),
 
   // Replace one chart (after an edit/revert/finalize) in both places.

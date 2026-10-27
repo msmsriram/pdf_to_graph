@@ -214,8 +214,8 @@ def document_summary(manifest: dict[str, Any]) -> dict[str, Any]:
         "pdf_count": sum(s.get("kind") == "pdf" for s in manifest.get("sources", [])),
         "chart_types": types,
         "finalized_count": sum(c.get("final_version") == c.get("current_version") and c.get("final_version") is not None for c in charts),
-        "estimated_cost_usd": sum(b["totals"].get("cost_usd", 0) for b in blocks) if blocks else None,
-        "pricing_complete": bool(blocks) and all((b.get("pricing") or {}).get("known", False) for b in blocks),
+        "estimated_cost_usd": sum(b["totals"].get("cost_usd", 0) or 0 for b in blocks) if any((b.get("pricing") or {}).get("known") for b in blocks) else None,
+        "pricing_complete": bool(blocks) and all((b.get("pricing") or {}).get("known", False) and not b["totals"].get("unpriced_calls", 0) and not b["totals"].get("uncertain_calls", 0) for b in blocks),
         "reprocessed_from": manifest.get("reprocessed_from"),
         "source_files_available": manifest.get("source_files_available", True),
     })

@@ -27,14 +27,14 @@ export default function App() {
   useEffect(() => {
     if (view !== "processing" || !documentId) return;
     const close = subscribeDocument(documentId, async (ev) => {
-      handleEvent(ev);
+      if (handleEvent(ev) === false) return;
       if (ev.type === "complete" || ev.type === "error") {
         try {
           const doc = await api.getDocument(documentId);
-          setDocument(doc);
+          if (useStore.getState().documentId === documentId) setDocument(doc);
         } catch (_) {}
       }
-    });
+    }, () => useStore.getState().eventCursor);
     return close;
   }, [view, documentId, handleEvent, setDocument]);
 

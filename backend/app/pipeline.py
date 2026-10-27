@@ -1,21 +1,14 @@
-"""Document processing pipeline.
+"""Bounded page batches: concurrent model calls, serialized durable commits.
 
-Runs as a background asyncio task. Heavy/blocking work (PDF render, model calls,
-image crop) is pushed to threads so the event loop keeps flushing WebSocket
-events. Every meaningful step emits an event on the bus for the live UI.
-
-A document = one optional PDF + any number of user-named images. PDF pages are
-rendered first (page 1..N); images follow as pages N+1.. with the user's label.
-
-Per page:  gate (cheap model: "any chart here?")  →  skip, or  →  extraction (Astra).
-Uploaded images skip the gate by default (explicit user intent). Skipped pages keep
-their gate verdict and can be processed later via `analyze_page_now` ("Process anyway").
+Every page uses the same bounded document context. Charts are published as soon
+as that page commits, and both persisted and live results sort by source order.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import time
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -27,10 +20,93 @@ from .events import bus
 from .openai_client import extract_page
 from .schemas import ExtractedChart
 
+_tasks: dict[str, asyncio.Task] = {}
+_runtimes = weakref.WeakKeyDictionary()
+_inflight: set[asyncio.Task] = set()
+
+
+def _runtime():
+    loop = asyncio.get_running_loop()
+    if loop not in _runtimes:
+        s = get_settings()
+        _runtimes[loop] = {"all": asyncio.Semaphore(s.llm_concurrency),
+                           "gate": asyncio.Semaphore(s.gate_concurrency),
+                           "extract": asyncio.Semaphore(s.extraction_concurrency),
+                           "commits": {}, "pages": {}}
+    return _runtimes[loop]
+
+
+def _commit_lock(document_id):
+    return _runtime()["commits"].setdefault(document_id, asyncio.Lock())
+
+
+async def _settled(func, *args):
+    """Let finite disk/database work settle before cancellation releases its lock."""
+    task = asyncio.create_task(asyncio.to_thread(func, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
+
+
+async def _write(m):
+    await _settled(storage.write_manifest, m)
+
+
+async def _read(document_id):
+    return await asyncio.to_thread(storage.read_manifest, document_id)
+
+
+async def _model_call(scope, func, *args):
+    """Global per-process limits cover every document and both model stages.
+
+The SDK retries transient rate limits with backoff. A cancelled synchronous call
+still occupies its slots until the underlying request actually finishes.
+"""
+    runtime = _runtime()
+    stage, total = runtime[scope], runtime["all"]
+    queued = time.perf_counter()
+    await stage.acquire()
+    try:
+        await total.acquire()
+    except BaseException:
+        stage.release()
+        raise
+    queue_seconds = round(time.perf_counter() - queued, 2)
+
+    def invoke():
+        started = time.perf_counter()
+        result = func(*args)
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
+            result[1]["seconds"] = round(time.perf_counter() - started, 2)
+            result[1]["queue_seconds"] = queue_seconds
+        return result
+
+    task = asyncio.create_task(asyncio.to_thread(invoke))
+    _inflight.add(task)
+
+    def finished(task):
+        _inflight.discard(task)
+        if not task.cancelled():
+            task.exception()  # Consume failures from calls abandoned by cancellation.
+
+    task.add_done_callback(finished)
+    deferred = False
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        deferred = True
+        task.add_done_callback(lambda _: (stage.release(), total.release()))
+        raise
+    finally:
+        if not deferred:
+            stage.release()
+            total.release()
+
 
 async def _emit(document_id: str, event: dict[str, Any]) -> None:
-    event["document_id"] = document_id
-    await bus.publish(document_id, event)
+    await bus.publish(document_id, {**event, "document_id": document_id})
 
 
 async def _log(document_id: str, message: str, level: str = "info") -> None:
@@ -38,26 +114,15 @@ async def _log(document_id: str, message: str, level: str = "info") -> None:
 
 
 def _page_xml(page_number: int, summary: str, charts: list[dict]) -> str:
-    """Human-readable XML artifact written per page (debug / traceability)."""
-    lines = [f'<page number="{page_number}">', "  <summary>", f"    {summary}", "  </summary>"]
-    if charts:
-        lines.append("  <charts>")
-        for c in charts:
-            spec = c["versions"][0]["spec"]
-            lines.append(f'    <chart id="{c["chart_id"]}" type="{spec.get("chart_type")}">')
-            lines.append(f"      {json.dumps(spec, ensure_ascii=False)}")
-            lines.append("    </chart>")
-        lines.append("  </charts>")
-    lines.append("</page>")
-    return "\n".join(lines)
+    return json.dumps({"page_number": page_number, "summary": summary, "charts": charts}, ensure_ascii=False, indent=2)
 
 
 def _image_to_page_png(src: Path, dst: Path) -> dict[str, Any]:
-    """Normalise an uploaded image (png/jpeg/webp) into a page PNG."""
     dst.parent.mkdir(parents=True, exist_ok=True)
-    img = Image.open(src).convert("RGB")
-    img.save(str(dst))
-    return {"width": img.width, "height": img.height}
+    with Image.open(src) as original:
+        image = original.convert("RGB")
+        image.save(dst)
+        return {"width": image.width, "height": image.height}
 
 
 def _find_page(m: dict[str, Any], page_no: int) -> dict[str, Any]:
@@ -68,25 +133,15 @@ def _label(p: dict[str, Any]) -> str:
     return p.get("label") or f"Page {p['page_number']}"
 
 
-# --------------------------------------------------------------------------- #
-# Whole document
-# --------------------------------------------------------------------------- #
-# Running processing tasks by document id (also keeps a strong reference: the event loop
-# holds tasks only weakly, so an unreferenced task can be garbage-collected mid-run).
-_tasks: dict[str, asyncio.Task] = {}
-
-
 def start(document_id: str) -> None:
-    """Kick off background processing for a freshly uploaded document."""
+    if document_id in _tasks and not _tasks[document_id].done():
+        return
     task = asyncio.create_task(process_document(document_id))
     _tasks[document_id] = task
     task.add_done_callback(lambda t: _tasks.pop(document_id, None) if _tasks.get(document_id) is t else None)
 
 
 async def cancel(document_id: str) -> bool:
-    """Stop a document's processing. Charts already extracted are kept. A model call that is
-    in flight can't be aborted mid-request: it finishes in its thread and its result is
-    discarded. Returns False if nothing was running."""
     task = _tasks.get(document_id)
     if task and not task.done():
         task.cancel()
@@ -95,8 +150,7 @@ async def cancel(document_id: str) -> bool:
         except asyncio.CancelledError:
             pass
         return True
-    # No live task (e.g. the server restarted mid-run): an 'in progress' status is stale.
-    m = await asyncio.to_thread(storage.read_manifest, document_id)
+    m = await _read(document_id)
     if m and m.get("status") in {"uploaded", "rendering", "analyzing"}:
         await _mark_cancelled(document_id)
         return True
@@ -104,262 +158,232 @@ async def cancel(document_id: str) -> bool:
 
 
 async def _mark_cancelled(document_id: str) -> None:
-    m = await asyncio.to_thread(storage.read_manifest, document_id)
-    n = len(m.get("charts", [])) if m else 0
-    msg = f"Stopped by user — {n} chart(s) extracted before stopping"
-    await asyncio.to_thread(storage.set_status, document_id, "cancelled", msg)
-    await _emit(document_id, {"type": "status", "status": "cancelled", "message": msg})
-    await _log(document_id, msg, "warn")
+    async with _commit_lock(document_id):
+        m = await _read(document_id)
+        if not m:
+            return
+        message = f"Stopped by user — {len(m.get('charts', []))} chart(s) saved before stopping"
+        m.update(status="cancelled", status_message=message, updated_at=storage._now())
+        await _write(m)
+        await _emit(document_id, {"type": "status", "status": "cancelled", "message": message})
+
+
+async def _screen_page(document_id, pm):
+    s = get_settings()
+    page_no, label = pm["page_number"], pm["label"]
+    path = await asyncio.to_thread(storage.asset_path, document_id, f"pages/{pm['filename']}")
+    await _log(document_id, f"Screening {label} with {s.gate_model}")
+    started = time.perf_counter()
+    verdict, usage = await _model_call("gate", gate.classify_page, path)
+    usage.setdefault("seconds", round(time.perf_counter() - started, 2))
+    probability = gate.chart_probability(verdict)
+    skipped = probability < s.gate_threshold
+    async with _commit_lock(document_id):
+        m = await _read(document_id)
+        page = _find_page(m, page_no)
+        block = costs.ensure_gate_block(m, s.gate_model)
+        usage["cost_usd"] = costs.cost_usd(usage, block["pricing"])
+        costs.add_to_totals(block["totals"], usage)
+        page["gate"] = {**verdict.model_dump(), "p_charts": round(probability, 3), "skipped": skipped, "usage": usage}
+        if skipped:
+            page.update(status="skipped", summary=f"Skipped by gate: {verdict.reason}")
+            m["progress"]["pages_analyzed"] += 1
+            m["progress"]["pages_skipped"] = m["progress"].get("pages_skipped", 0) + 1
+        m["updated_at"] = storage._now()
+        await _write(m)
+        await _emit(document_id, {"type": "usage", "scope": "gate", "page_number": page_no, "usage": usage,
+                                  "totals": block["totals"], "model": block["model"], "pricing": block["pricing"], "verdict": page["gate"]})
+        await _emit(document_id, {"type": "progress", "progress": m["progress"]})
+    if skipped:
+        await _log(document_id, f"{label}: no charts (gate {probability:.0%}) — skipped. {verdict.reason}")
+        await _emit(document_id, {"type": "page_skipped", "page_number": page_no, "reason": verdict.reason})
+    else:
+        await _log(document_id, f"{label}: gate sees {verdict.chart_count} chart(s) ({probability:.0%}) → extracting with {s.openai_model}")
+    return skipped
+
+
+async def _run_page(document_id, pm, context):
+    s = get_settings()
+    try:
+        use_gate = s.gate_enabled and s.gate_model and (pm["kind"] == "pdf" or s.gate_images)
+        if use_gate and await _screen_page(document_id, pm):
+            return
+        await analyze_page(document_id, pm["page_number"], context)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        async with _commit_lock(document_id):
+            m = await _read(document_id)
+            page = _find_page(m, pm["page_number"])
+            if page["status"] not in {"analyzed", "skipped", "error"}:
+                m["progress"]["pages_analyzed"] += 1
+            page.update(status="error", error=str(exc))
+            await _write(m)
+            await _emit(document_id, {"type": "progress", "progress": m["progress"]})
+        await _log(document_id, f"{pm['label']}: processing failed — {type(exc).__name__}: {exc}", "error")
+
+
+async def _run_batch(document_id, pages, context):
+    tasks = [asyncio.create_task(_run_page(document_id, p, context)) for p in pages]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 async def process_document(document_id: str) -> None:
-    settings = get_settings()
+    s = get_settings()
     d = storage.doc_dir(document_id)
-
     try:
-        # -------- 1. Render PDF pages + normalise images into pages --------
+        await _settled(storage.set_status, document_id, "rendering", "Preparing pages")
         await _emit(document_id, {"type": "status", "status": "rendering", "message": "Preparing pages"})
-        await asyncio.to_thread(storage.set_status, document_id, "rendering", "Preparing pages")
-
-        m = await asyncio.to_thread(storage.read_manifest, document_id)
-        sources = m.get("sources") or []
+        m = await _read(document_id)
         originals = await asyncio.to_thread(storage.source_paths, document_id, m)
-        has_pdf = any(relative == "original.pdf" for relative, _ in originals)
-        image_srcs = [s for s in sources if s.get("kind") == "image"]
-
-        pages_meta: list[dict[str, Any]] = []
-        if has_pdf:
-            pdf_path = d / "original.pdf"
-            total = pdf_processor.page_count(pdf_path)
-            m["original_pdf_page_count"] = total
-            await asyncio.to_thread(storage.write_manifest, m)
-            if total > settings.max_pages:
-                await _log(document_id, f"PDF has {total} pages; processing first {settings.max_pages} (MAX_PAGES cap).", "warn")
-            rendered = await asyncio.to_thread(
-                pdf_processor.render_pdf_to_pngs, pdf_path, d / "pages", settings.render_dpi, settings.max_pages
-            )
-            for pm in rendered:
-                pm["kind"] = "pdf"
-                pm["label"] = f"Page {pm['page_number']}"
-            pages_meta.extend(rendered)
-
-        next_no = len(pages_meta) + 1
-        for src in image_srcs:
-            fn = f"page_{next_no:03d}.png"
-            meta = await asyncio.to_thread(_image_to_page_png, d / "sources" / src["filename"], d / "pages" / fn)
-            pages_meta.append(
-                {"page_number": next_no, "filename": fn, "width": meta["width"], "height": meta["height"], "kind": "image", "label": src.get("label") or src["filename"]}
-            )
-            next_no += 1
-
-        m = await asyncio.to_thread(storage.read_manifest, document_id)
-        m["page_count"] = len(pages_meta)
-        m["progress"]["pages_total"] = len(pages_meta)
-        await asyncio.to_thread(storage.write_manifest, m)
+        context = ""
+        pages = []
+        if any(relative == "original.pdf" for relative, _ in originals):
+            pdf = d / "original.pdf"
+            m["original_pdf_page_count"] = await asyncio.to_thread(pdf_processor.page_count, pdf)
+            context = await asyncio.to_thread(pdf_processor.document_context, pdf, s.max_pages)
+            if m["original_pdf_page_count"] > s.max_pages:
+                await _log(document_id, f"Processing first {s.max_pages} of {m['original_pdf_page_count']} PDF pages (MAX_PAGES cap).", "warn")
+            rendered = await _settled(pdf_processor.render_pdf_to_pngs, pdf, d / "pages", s.render_dpi, s.max_pages)
+            pages.extend({**p, "kind": "pdf", "label": f"Page {p['page_number']}"} for p in rendered)
+        for source in m.get("sources", []):
+            if source.get("kind") != "image":
+                continue
+            number = len(pages) + 1
+            filename = f"page_{number:03d}.png"
+            meta = await _settled(_image_to_page_png, d / "sources" / source["filename"], d / "pages" / filename)
+            pages.append({"page_number": number, "filename": filename, **meta, "kind": "image", "label": source.get("label") or source["filename"]})
+        m["page_count"] = len(pages)
+        m["pages"] = [{"page_number": p["page_number"], "kind": p["kind"], "label": p["label"],
+                       "image": f"pages/{p['filename']}", "width": p["width"], "height": p["height"],
+                       "summary": "", "status": "pending", "gate": None, "has_charts": False, "chart_ids": []} for p in pages]
+        m["progress"].update(pages_total=len(pages), pages_rendered=len(pages))
+        m["document_context"] = context
+        m["processing_config"] = {"page_batch_size": s.page_batch_size, "llm_concurrency": s.llm_concurrency,
+                                   "gate_concurrency": s.gate_concurrency, "extraction_concurrency": s.extraction_concurrency,
+                                   "context_mode": "shared_native_text", "started_at": storage._now()}
+        await _write(m)
+        for p in m["pages"]:
+            await _emit(document_id, {"type": "page_rendered", **p})
         await _emit(document_id, {"type": "progress", "progress": m["progress"]})
 
-        for pm in pages_meta:
-            m = await asyncio.to_thread(storage.read_manifest, document_id)
-            m["pages"].append(
-                {
-                    "page_number": pm["page_number"],
-                    "kind": pm["kind"],
-                    "label": pm["label"],
-                    "image": f"pages/{pm['filename']}",
-                    "width": pm["width"],
-                    "height": pm["height"],
-                    "summary": "",
-                    "status": "pending",  # pending | skipped | analyzed
-                    "gate": None,
-                    "has_charts": False,
-                    "chart_ids": [],
-                }
-            )
-            m["progress"]["pages_rendered"] += 1
-            await asyncio.to_thread(storage.write_manifest, m)
-            await _emit(
-                document_id,
-                {"type": "page_rendered", "page_number": pm["page_number"], "kind": pm["kind"], "label": pm["label"],
-                 "image": f"pages/{pm['filename']}", "width": pm["width"], "height": pm["height"]},
-            )
-            await _emit(document_id, {"type": "progress", "progress": m["progress"]})
+        for offset in range(0, len(pages), s.page_batch_size):
+            group = pages[offset:offset + s.page_batch_size]
+            message = f"Processing pages {offset + 1}–{offset + len(group)} of {len(pages)} · up to {s.llm_concurrency} model calls at once"
+            await _settled(storage.set_status, document_id, "analyzing", message)
+            await _emit(document_id, {"type": "status", "status": "analyzing", "message": message})
+            await _run_batch(document_id, group, context)
 
-        # -------- 2. Gate, then analyze (sequential for continuity notes) --------
-        gate_on = settings.gate_enabled and bool(settings.gate_model)
-        msg = f"Screening pages with {settings.gate_model}, extracting with {settings.openai_model}" if gate_on else f"Analyzing pages with {settings.openai_model}"
-        await _emit(document_id, {"type": "status", "status": "analyzing", "message": msg})
-        await asyncio.to_thread(storage.set_status, document_id, "analyzing", msg)
-
-        running_notes = ""
-        for pm in pages_meta:
-            page_no = pm["page_number"]
-            label = pm["label"]
-            use_gate = gate_on and (pm["kind"] == "pdf" or settings.gate_images)
-
-            if use_gate:
-                await _emit(document_id, {"type": "status", "status": "analyzing", "message": f"Screening {label} with {settings.gate_model}"})
-                t0 = time.perf_counter()
-                verdict, gusage = await asyncio.to_thread(gate.classify_page, d / "pages" / pm["filename"])
-                gusage["seconds"] = round(time.perf_counter() - t0, 2)
-
-                m = await asyncio.to_thread(storage.read_manifest, document_id)
-                page_entry = _find_page(m, page_no)
-                gblock = costs.ensure_gate_block(m, settings.gate_model)
-                gusage["cost_usd"] = costs.cost_usd(gusage, gblock["pricing"])
-                costs.add_to_totals(gblock["totals"], gusage)
-                p_charts = gate.chart_probability(verdict)
-                skip = p_charts < settings.gate_threshold
-                page_entry["gate"] = {**verdict.model_dump(), "p_charts": round(p_charts, 3), "skipped": skip, "usage": gusage}
-                if skip:
-                    page_entry["status"] = "skipped"
-                    page_entry["summary"] = f"Skipped by gate: {verdict.reason}"
-                    m["progress"]["pages_analyzed"] += 1
-                    m["progress"]["pages_skipped"] = m["progress"].get("pages_skipped", 0) + 1
-                await asyncio.to_thread(storage.write_manifest, m)
-
-                await _emit(document_id, {"type": "usage", "scope": "gate", "page_number": page_no, "usage": gusage,
-                                          "totals": gblock["totals"], "model": gblock["model"], "pricing": gblock["pricing"]})
-                if skip:
-                    await _log(document_id, f"{label}: no charts (gate {p_charts:.0%} likely) — skipped, {settings.openai_model} not called. {verdict.reason}")
-                    await _emit(document_id, {"type": "page_skipped", "page_number": page_no, "reason": verdict.reason, "confidence": verdict.confidence})
-                    await _emit(document_id, {"type": "progress", "progress": m["progress"]})
-                    continue
-                await _log(document_id, f"{label}: gate sees {verdict.chart_count} chart(s) ({p_charts:.0%}) → extracting with {settings.openai_model}")
-            elif pm["kind"] == "image":
-                await _log(document_id, f"{label}: uploaded image — sent straight to {settings.openai_model}")
-
-            running_notes = await analyze_page(document_id, page_no, running_notes)
-
-        # -------- 3. Done --------
-        m = await asyncio.to_thread(storage.read_manifest, document_id)
-        skipped = m["progress"].get("pages_skipped", 0)
-        done_msg = f"Done — {len(m['charts'])} charts extracted" + (f", {skipped} page(s) skipped by the gate" if skipped else "")
-        await asyncio.to_thread(storage.set_status, document_id, "complete", done_msg)
-        await _emit(document_id, {"type": "status", "status": "complete", "message": done_msg})
-        await _emit(document_id, {"type": "complete", "charts_count": len(m["charts"])})
-
+        m = await _read(document_id)
+        failed = [p for p in m["pages"] if p["status"] == "error"]
+        message = f"{len(m['charts'])} charts saved · {m['progress'].get('pages_skipped', 0)} pages skipped"
+        m.update(status="error" if failed else "complete", status_message=message,
+                 error=f"{len(failed)} page(s) failed; successful pages were retained" if failed else None,
+                 updated_at=storage._now(), processing_finished_at=storage._now())
+        await _write(m)
+        await _emit(document_id, {"type": "status", "status": m["status"], "message": message})
+        await _emit(document_id, {"type": "error", "message": m["error"]} if failed else {"type": "complete", "charts_count": len(m["charts"])})
     except asyncio.CancelledError:
         await _mark_cancelled(document_id)
         raise
-    except Exception as exc:  # noqa: BLE001
-        import traceback
-
-        traceback.print_exc()
-        await asyncio.to_thread(storage.set_status, document_id, "error", "Processing failed", error=str(exc))
+    except Exception as exc:
+        await _settled(storage.set_status, document_id, "error", "Processing failed", str(exc))
         await _emit(document_id, {"type": "error", "message": str(exc)})
 
 
-# --------------------------------------------------------------------------- #
-# One page through the extraction model
-# --------------------------------------------------------------------------- #
 async def analyze_page(document_id: str, page_no: int, running_notes: str = "") -> str:
-    """Full extraction for one page: charts, crops, versions, usage, events.
-    Returns the updated running notes for the next page."""
-    settings = get_settings()
-    d = storage.doc_dir(document_id)
-    m = await asyncio.to_thread(storage.read_manifest, document_id)
-    page_entry = _find_page(m, page_no)
-    label = _label(page_entry)
-    page_png = await asyncio.to_thread(storage.asset_path, document_id, page_entry["image"])
-    total = m.get("page_count") or len(m["pages"])
+    lock = _runtime()["pages"].setdefault((document_id, page_no), asyncio.Lock())
+    async with lock:
+        s = get_settings()
+        m = await _read(document_id)
+        page = _find_page(m, page_no)
+        if page["status"] == "analyzed":
+            return page.get("context_notes", "")
+        path = await asyncio.to_thread(storage.asset_path, document_id, page["image"])
+        await _log(document_id, f"Sending {_label(page)} to {s.openai_model} ({s.reasoning_effort} reasoning)…")
+        started = time.perf_counter()
+        extraction, usage = await _model_call("extract", extract_page, path, page_no, running_notes)
+        usage.setdefault("seconds", round(time.perf_counter() - started, 2))
 
-    await _emit(document_id, {"type": "status", "status": "analyzing", "message": f"Reading {label} ({page_no} of {total})"})
-    await _log(document_id, f"Sending {label} to {settings.openai_model} ({settings.reasoning_effort} reasoning)…")
-
-    t0 = time.perf_counter()
-    extraction, usage = await asyncio.to_thread(extract_page, page_png, page_no, running_notes)
-    usage["seconds"] = round(time.perf_counter() - t0, 2)
-    new_notes = (extraction.updated_running_notes or running_notes)[:2000]
-
-    m = await asyncio.to_thread(storage.read_manifest, document_id)
-    page_entry = _find_page(m, page_no)
-    page_entry["summary"] = extraction.summary
-    page_entry["has_charts"] = bool(extraction.charts)
-    page_entry["status"] = "analyzed"
-    m["progress"]["pages_analyzed"] += 1
-    # token/cost accounting for this page (API-billed counts x list price)
-    ublock = costs.ensure_usage_block(m, settings.openai_model)
-    usage["cost_usd"] = costs.cost_usd(usage, ublock["pricing"])
-    page_entry["usage"] = usage
-    costs.add_to_totals(ublock["totals"], usage)
-
-    created_charts: list[dict] = []
-    existing_ids = {c["chart_id"] for c in m["charts"]}
-    idx = 0
-    for ec in extraction.charts:
-        idx += 1
-        chart_id = f"p{page_no:03d}_c{idx:02d}"
-        while chart_id in existing_ids:  # re-analysis of a page: never reuse an id
-            idx += 1
-            chart_id = f"p{page_no:03d}_c{idx:02d}"
-        existing_ids.add(chart_id)
-        m["progress"]["charts_detected"] += 1
-
-        # crop original region for side-by-side comparison
-        crop_meta = await asyncio.to_thread(pdf_processor.crop_chart, page_png, ec.bbox, d / "charts" / f"{chart_id}.png")
-        crop_rel = f"charts/{chart_id}.png"
-        await _emit(document_id, {"type": "chart_detected", "chart_id": chart_id, "page_number": page_no, "crop_image": crop_rel})
-
-        spec = _spec_from_extracted(ec, crop_box=crop_meta.get("box_norm"))
-        # measure the original's stroke weight / text size from the crop (no model call)
-        spec["style_metrics"] = await asyncio.to_thread(style_metrics.measure, d / "charts" / f"{chart_id}.png", spec.get("plot_rect"), spec)
-        chart_obj = {
-            "chart_id": chart_id,
-            "page_number": page_no,
-            "crop_image": crop_rel,
-            "bbox": ec.bbox,
-            "confidence": ec.confidence.model_dump(),
-            "status": "extracted",
-            "current_version": 0,
-            "final_version": None,
-            "versions": [{"version": 0, "label": "Original extraction", "kind": "original", "created_at": storage._now(), "spec": spec}],
-        }
-        m["charts"].append(chart_obj)
-        page_entry["chart_ids"].append(chart_id)
-        created_charts.append(chart_obj)
-        m["progress"]["charts_extracted"] += 1
-        await _emit(document_id, {"type": "chart_extracted", "chart": chart_obj})
-        await _emit(document_id, {"type": "progress", "progress": m["progress"]})
-
-    m["charts_count"] = len(m["charts"])
-    await asyncio.to_thread(storage.write_manifest, m)
-    await _emit(document_id, {"type": "usage", "scope": "extract", "page_number": page_no, "usage": usage,
-                              "totals": ublock["totals"], "model": ublock["model"], "pricing": ublock["pricing"]})
-    await _log(document_id, f"{label}: {usage['input_tokens']:,} in / {usage['output_tokens']:,} out tokens → ${usage['cost_usd']:.4f} in {usage['seconds']}s")
-
-    xml = _page_xml(page_no, extraction.summary, created_charts)
-    (d / f"page_{page_no:03d}.txt").write_text(f"<document_page>\n{xml}\n</document_page>\n", encoding="utf-8")
-
-    await _emit(document_id, {"type": "page_analyzed", "page_number": page_no, "summary": extraction.summary, "charts_found": len(created_charts)})
-    await _emit(document_id, {"type": "progress", "progress": m["progress"]})
-    return new_notes
+        async with _commit_lock(document_id):
+            m = await _read(document_id)
+            page = _find_page(m, page_no)
+            page.update(summary=extraction.summary, has_charts=bool(extraction.charts), status="analyzed",
+                        context_notes=(extraction.updated_running_notes or "")[:2000])
+            page.pop("error", None)
+            m["progress"]["pages_analyzed"] += 1
+            block = costs.ensure_usage_block(m, s.openai_model)
+            usage["cost_usd"] = costs.cost_usd(usage, block["pricing"])
+            page["usage"] = usage
+            costs.add_to_totals(block["totals"], usage)
+            created = []
+            existing = {c["chart_id"] for c in m["charts"]}
+            index = 0
+            for extracted in extraction.charts:
+                index += 1
+                cid = f"p{page_no:03d}_c{index:02d}"
+                while cid in existing:
+                    index += 1
+                    cid = f"p{page_no:03d}_c{index:02d}"
+                existing.add(cid)
+                rel = f"charts/{cid}.png"
+                crop = storage.doc_dir(document_id) / rel
+                crop_meta = await _settled(pdf_processor.crop_chart, path, extracted.bbox, crop)
+                spec = _spec_from_extracted(extracted, crop_box=crop_meta.get("box_norm"))
+                spec["style_metrics"] = await asyncio.to_thread(style_metrics.measure, crop, spec.get("plot_rect"), spec)
+                chart = {"chart_id": cid, "page_number": page_no, "crop_image": rel, "bbox": extracted.bbox,
+                         "confidence": extracted.confidence.model_dump(), "status": "extracted", "current_version": 0,
+                         "final_version": None, "versions": [{"version": 0, "label": "Original extraction", "kind": "original",
+                                                               "created_at": storage._now(), "spec": spec}]}
+                m["charts"].append(chart)
+                page["chart_ids"].append(cid)
+                created.append(chart)
+            m["charts"].sort(key=lambda c: (c["page_number"], int(c["chart_id"].rsplit("_c", 1)[1])))
+            m["charts_count"] = len(m["charts"])
+            m["progress"].update(charts_detected=len(m["charts"]), charts_extracted=len(m["charts"]))
+            m["updated_at"] = storage._now()
+            (storage.doc_dir(document_id) / f"page_{page_no:03d}.txt").write_text(_page_xml(page_no, extraction.summary, created), encoding="utf-8")
+            await _write(m)
+            await _emit(document_id, {"type": "usage", "scope": "extract", "page_number": page_no, "usage": usage,
+                                      "totals": block["totals"], "model": block["model"], "pricing": block["pricing"]})
+            for chart in created:
+                await _emit(document_id, {"type": "chart_detected", "chart_id": chart["chart_id"], "page_number": page_no, "crop_image": chart["crop_image"]})
+                await _emit(document_id, {"type": "chart_extracted", "chart": chart})
+            await _emit(document_id, {"type": "progress", "progress": m["progress"]})
+            await _emit(document_id, {"type": "page_analyzed", "page_number": page_no, "summary": extraction.summary, "charts_found": len(created)})
+        amount = f"${usage['cost_usd']:.6f}" if usage["cost_usd"] is not None else "cost unknown (model price not configured)"
+        await _log(document_id, f"{_label(page)}: {usage['input_tokens']:,} in / {usage['output_tokens']:,} out tokens → {amount} in {usage['seconds']}s")
+        return page["context_notes"]
 
 
 async def analyze_page_now(document_id: str, page_no: int) -> dict[str, Any]:
-    """Manual override ("Process anyway") for a page the gate skipped. Returns the manifest."""
-    m = await asyncio.to_thread(storage.read_manifest, document_id)
-    page_entry = _find_page(m, page_no)
-    if page_entry.get("status") == "skipped":
-        m["progress"]["pages_skipped"] = max(0, m["progress"].get("pages_skipped", 0) - 1)
-        m["progress"]["pages_analyzed"] = max(0, m["progress"].get("pages_analyzed", 0) - 1)
-        if isinstance(page_entry.get("gate"), dict):
-            page_entry["gate"]["skipped"] = False
-            page_entry["gate"]["overridden"] = True
-    page_entry["status"] = "pending"
-    await asyncio.to_thread(storage.write_manifest, m)
+    async with _commit_lock(document_id):
+        m = await _read(document_id)
+        page = _find_page(m, page_no)
+        if page["status"] == "analyzed":
+            return m
+        if page["status"] in {"skipped", "error"}:
+            m["progress"]["pages_analyzed"] = max(0, m["progress"]["pages_analyzed"] - 1)
+        if page["status"] == "skipped":
+            m["progress"]["pages_skipped"] = max(0, m["progress"].get("pages_skipped", 0) - 1)
+            page["gate"].update(skipped=False, overridden=True)
+        page["status"] = "pending"
+        await _write(m)
+    await analyze_page(document_id, page_no, m.get("document_context", ""))
+    m = await _read(document_id)
+    failed = sum(p["status"] == "error" for p in m["pages"])
+    m.update(status="error" if failed else "complete", error=f"{failed} page(s) failed" if failed else None,
+             status_message=f"{len(m['charts'])} charts saved", updated_at=storage._now())
+    await _write(m)
+    return m
 
-    await analyze_page(document_id, page_no, "")
 
-    m = await asyncio.to_thread(storage.read_manifest, document_id)
-    skipped = m["progress"].get("pages_skipped", 0)
-    done_msg = f"Done — {len(m['charts'])} charts extracted" + (f", {skipped} page(s) skipped by the gate" if skipped else "")
-    await asyncio.to_thread(storage.set_status, document_id, "complete", done_msg)
-    return await asyncio.to_thread(storage.read_manifest, document_id)
-
-
-# --------------------------------------------------------------------------- #
-# Spec helpers
-# --------------------------------------------------------------------------- #
 def _plot_rect_in_crop(plot: list[float] | None, crop_box: list[float] | None) -> list[float] | None:
     """Map the model's plot-area rectangle into the crop's own frame (0..1).
 

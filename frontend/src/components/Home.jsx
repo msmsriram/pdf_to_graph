@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import { motion, AnimatePresence } from "framer-motion";
 import { useStore } from "../store.js";
@@ -29,11 +29,12 @@ export default function Home() {
   const [uploadPct, setUploadPct] = useState(0);
   const [error, setError] = useState(null);
   const [reprocessing, setReprocessing] = useState(null);
+  const removedIds = useRef(new Set());
   const startProcessing = useStore((s) => s.startProcessing);
   const openWorkspace = useStore((s) => s.openWorkspace);
 
   const refresh = useCallback(() => {
-    api.listDocuments().then(setDocs).catch((e) => setError(e?.response?.data?.detail || "Could not load saved documents"));
+    api.listDocuments().then((rows) => setDocs(rows.filter((d) => !removedIds.current.has(d.document_id)))).catch((e) => setError(e?.response?.data?.detail || "Could not load saved documents"));
   }, []);
   useEffect(() => {
     refresh();
@@ -136,10 +137,15 @@ export default function Home() {
 
   const del = async (e, id) => {
     e.stopPropagation();
+    const removed = docs.find((d) => d.document_id === id);
+    if (removedIds.current.has(id)) return;
+    removedIds.current.add(id);
+    setDocs((rows) => rows.filter((d) => d.document_id !== id));
     try {
       await api.deleteDocument(id);
-      refresh();
     } catch (err) {
+      removedIds.current.delete(id);
+      if (removed) setDocs((rows) => rows.some((d) => d.document_id === id) ? rows : [...rows, removed].sort((a, b) => b.created_at.localeCompare(a.created_at)));
       setError(err?.response?.data?.detail || "Delete failed");
     }
   };

@@ -40,6 +40,15 @@ def page_count(pdf_path: Path) -> int:
         doc.close()
 
 
+def document_context(pdf_path: Path, max_pages: int, max_chars: int = 6000) -> str:
+    """One bounded native-text context, shared unchanged by parallel page calls."""
+    with fitz.open(pdf_path) as doc:
+        count = min(len(doc), max_pages)
+        budget = max(1, max_chars // max(count, 1))
+        chunks = [f"Page {i + 1}: {doc[i].get_text()[:budget]}" for i in range(count)]
+    return "\n".join(chunks)[:max_chars]
+
+
 def crop_chart(page_png: Path, bbox: list[float], out_path: Path) -> dict:
     """Crop a normalized bbox [x0,y0,x1,y1] (0..1) from the page image.
 
