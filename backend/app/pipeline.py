@@ -357,8 +357,7 @@ async def analyze_page(document_id: str, page_no: int, running_notes: str = "") 
                 await _emit(document_id, {"type": "chart_extracted", "chart": chart})
             await _emit(document_id, {"type": "progress", "progress": m["progress"]})
             await _emit(document_id, {"type": "page_analyzed", "page_number": page_no, "summary": extraction.summary, "charts_found": len(created)})
-        amount = f"${usage['cost_usd']:.6f}" if usage["cost_usd"] is not None else "cost unknown (model price not configured)"
-        await _log(document_id, f"{_label(page)}: {usage['input_tokens']:,} in / {usage['output_tokens']:,} out tokens → {amount} in {usage['seconds']}s")
+        await _log(document_id, f"{_label(page)}: {len(created)} chart(s) extracted in {usage['seconds']}s")
         return page["context_notes"]
 
 

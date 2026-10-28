@@ -242,7 +242,7 @@ export default function ChartEditor({ docId, chart }) {
     try {
       const updated = await api.rerunChart(docId, chart.chart_id, { effort: rerunEffort });
       updateChart(updated);
-      // refresh document-level usage/cost (the re-run is added to the totals)
+      // Refresh the saved document after appending the new chart version.
       api.getDocument(docId).then(setDocument).catch(() => {});
     } catch (e) {
       setRerunError(e?.response?.data?.detail || "Re-extraction failed");

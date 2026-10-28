@@ -5,7 +5,6 @@ import { subscribeDocument } from "./lib/ws.js";
 import Home from "./components/Home.jsx";
 import Processing from "./components/Processing.jsx";
 import Workspace from "./components/Workspace.jsx";
-import CostSidebar from "./components/CostSidebar.jsx";
 
 export default function App() {
   const view = useStore((s) => s.view);
@@ -15,8 +14,6 @@ export default function App() {
   const goHome = useStore((s) => s.goHome);
   const theme = useStore((s) => s.theme);
   const toggleTheme = useStore((s) => s.toggleTheme);
-  const costOpen = useStore((s) => s.costOpen);
-  const toggleCost = useStore((s) => s.toggleCost);
 
   // Apply the active theme to <html data-theme="…">.
   useEffect(() => {
@@ -58,11 +55,6 @@ export default function App() {
               ← Home
             </button>
           )}
-          {view !== "home" && (
-            <button className={`btn btn-sm ${costOpen ? "btn-primary" : ""}`} onClick={toggleCost} title="Token usage and cost for this PDF">
-              $ Cost
-            </button>
-          )}
           <button className="theme-toggle" onClick={toggleTheme} title="Toggle light / dark">
             {theme === "dark" ? (
               <>
@@ -87,7 +79,6 @@ export default function App() {
       {view === "home" && <Home />}
       {view === "processing" && <Processing />}
       {view === "workspace" && <Workspace />}
-      <CostSidebar />
     </>
   );
 }

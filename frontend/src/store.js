@@ -38,10 +38,6 @@ export const useStore = create((set, get) => ({
   logs: [],
   eventCursor: null,
   selectedChartId: null,
-  // Token/cost accounting streamed during processing (per page + running totals).
-  usageLive: null,
-  costOpen: false,
-  toggleCost: () => set((s) => ({ costOpen: !s.costOpen })),
 
   // Workspace side rails (chart list on the left, editor on the right): open by
   // default on wide screens, collapsed on narrow ones, and remembered.
@@ -60,7 +56,7 @@ export const useStore = create((set, get) => ({
   },
 
   goHome: () =>
-    set({ view: "home", documentId: null, document: null, liveCharts: [], logs: [], eventCursor: null, selectedChartId: null, usageLive: null, costOpen: false }),
+    set({ view: "home", documentId: null, document: null, liveCharts: [], logs: [], eventCursor: null, selectedChartId: null }),
 
   startProcessing: (documentId, name) =>
     set({
@@ -73,7 +69,6 @@ export const useStore = create((set, get) => ({
       statusMessage: "Uploaded, starting…",
       logs: [],
       eventCursor: null,
-      usageLive: null,
     }),
 
   openWorkspace: (doc) =>
@@ -96,8 +91,7 @@ export const useStore = create((set, get) => ({
     switch (ev.type) {
       case "snapshot":
         set({ document: ev.document, liveCharts: orderCharts(ev.document.charts || []),
-          progress: ev.document.progress, status: ev.document.status, statusMessage: ev.document.status_message,
-          usageLive: null });
+          progress: ev.document.progress, status: ev.document.status, statusMessage: ev.document.status_message });
         break;
       case "page_rendered": {
         const doc = s.document || {};
@@ -120,16 +114,10 @@ export const useStore = create((set, get) => ({
         set({ liveCharts: orderCharts([...s.liveCharts.filter((c) => c.chart_id !== ev.chart.chart_id), ev.chart]) });
         break;
       case "usage": {
-        const prev = s.usageLive || {};
         const document = s.document ? { ...s.document, pages: (s.document.pages || []).map((p) => p.page_number !== ev.page_number ? p :
           ev.scope === "gate" ? { ...p, gate: ev.verdict || p.gate, status: ev.verdict?.skipped ? "skipped" : p.status } :
           { ...p, usage: ev.usage, status: "analyzed" }) } : s.document;
-        if (ev.scope === "gate") {
-          const g = prev.gate || {};
-          set({ document, usageLive: { ...prev, gate: { model: ev.model, pricing: ev.pricing, totals: ev.totals, pages: { ...(g.pages || {}), [ev.page_number]: ev.usage } } } });
-        } else {
-          set({ document, usageLive: { ...prev, model: ev.model, pricing: ev.pricing, totals: ev.totals, pages: { ...(prev.pages || {}), [ev.page_number]: ev.usage } } });
-        }
+        set({ document });
         break;
       }
       case "complete":

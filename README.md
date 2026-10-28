@@ -1,5 +1,9 @@
 # PDF Chart Studio
 
+The `main` branch omits monetary amounts and cost panels from the application
+interface, including homepage cards, processing logs and the workspace.
+`pdf-graph-withcostdetail` preserves the complete cost-enabled interface.
+
 Upload a PDF → every chart in it is detected, reconstructed as an **editable** chart,
 and rendered in a workspace where you can change data/colors/axes, keep an immutable
 original, step back through versions, finalize, and export (PNG/JPEG/SVG/CSV/JSON).

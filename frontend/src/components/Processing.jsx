@@ -23,7 +23,7 @@ function Stat({ num, label, cls }) {
 }
 
 export default function Processing() {
-  const { document, status, statusMessage, progress, logs, liveCharts, openWorkspace, documentId, theme, setDocument, usageLive } = useStore();
+  const { document, status, statusMessage, progress, logs, liveCharts, openWorkspace, documentId, theme, setDocument } = useStore();
   const logRef = useRef(null);
 
   useEffect(() => {
@@ -35,20 +35,6 @@ export default function Processing() {
   const analyzed = p.pages_analyzed || 0;
   const pct = pagesTotal ? Math.round((analyzed / pagesTotal) * 100) : status === "complete" ? 100 : 0;
   const curIdx = ORDER.indexOf(status);
-  const usage = usageLive || {};
-  const savedUsage = document?.usage || {};
-  const pageCosts = (document?.pages || []).map((page) => {
-    const extraction = usage.pages?.[page.page_number] || page.usage;
-    const screening = usage.gate?.pages?.[page.page_number] || page.gate?.usage;
-    const extractionPricing = usage.pricing || savedUsage.pricing;
-    const screeningPricing = usage.gate?.pricing || savedUsage.gate?.pricing;
-    const known = (!extraction || (extractionPricing?.known && extraction.cost_usd != null)) &&
-      (!screening || (screeningPricing?.known && screening.cost_usd != null));
-    const amount = (Number(extraction?.cost_usd) || 0) + (Number(screening?.cost_usd) || 0);
-    return { ...page, recorded: !!(extraction || screening), known, amount,
-      extractionPending: !!screening && !extraction && page.status !== "skipped",
-      seconds: (Number(extraction?.seconds) || 0) + (Number(screening?.seconds) || 0) };
-  });
 
   const openResult = async () => {
     const doc = await api.getDocument(documentId);
@@ -130,15 +116,6 @@ export default function Processing() {
             })}
           </div>
 
-          {pageCosts.length > 0 && <>
-            <div className="section-title">Per-page model cost · screening + extraction</div>
-            <div style={{ maxHeight: 180, overflowY: "auto" }}>
-              {pageCosts.map((page) => <div key={page.page_number} style={{ display: "flex", justifyContent: "space-between", gap: 12, padding: "5px 0", fontSize: 12 }}>
-                <span>{page.label || `Page ${page.page_number}`}</span>
-                <span>{page.recorded ? `${page.known ? `$${page.amount.toFixed(6)}` : "Cost unknown"} · ${page.seconds.toFixed(1)}s${page.extractionPending ? " · extraction pending" : ""}` : "Waiting for usage"}</span>
-              </div>)}
-            </div>
-          </>}
           <div className="section-title">Live log</div>
           <div className="log-feed" ref={logRef}>
             {logs.length === 0 && <div className="log-line"><span className="lt">›</span> waiting for events…</div>}

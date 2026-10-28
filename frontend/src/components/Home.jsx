@@ -152,7 +152,7 @@ export default function Home() {
 
   const reprocess = async (e, id) => {
     e.stopPropagation();
-    if (!window.confirm("Process the saved original files again? This creates a new result, keeps the previous one, and incurs model usage charges.")) return;
+    if (!window.confirm("Process the saved original files again? This creates a new result and keeps the previous one.")) return;
     setReprocessing(id);
     setError(null);
     try {
@@ -275,7 +275,6 @@ export default function Home() {
                   </div>
                   <div className="doc-meta">
                     {d.finalized_count != null && <span>{d.finalized_count} finalized</span>}
-                    {d.estimated_cost_usd != null && <span title="Estimated model cost including screening and reruns">{d.pricing_complete ? "Est. " : "Known cost "}${Number(d.estimated_cost_usd).toFixed(4)}</span>}
                     {Object.entries(d.chart_types || {}).map(([type, count]) => <span key={type}>{count} {type}</span>)}
                   </div>
                   {d.source_files_available === false ? (
