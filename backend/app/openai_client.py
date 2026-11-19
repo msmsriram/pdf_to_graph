@@ -1,4 +1,4 @@
-"""Wrapper around the OpenAI vision model (OPENAI_MODEL, default gpt-6-astra) for page
+"""Wrapper around the OpenAI vision model (OPENAI_MODEL) for page
 understanding + chart extraction.
 
 Uses the Responses API with Structured Outputs (`responses.parse` +

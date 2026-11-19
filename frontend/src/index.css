@@ -241,6 +241,10 @@ body {
 /* ---------- workspace layout: [chart rail] [stage] [editor rail] ---------- */
 .ws-page { padding: 14px 20px 24px; }
 .ws-title { display: flex; align-items: baseline; gap: 14px; margin-bottom: 12px; flex-wrap: wrap; }
+.ws-archive { margin-left: auto; }
+.ws-archive.inline { gap: 8px; flex-wrap: wrap; }
+.ws-archive label { gap: 6px; }
+.ws-archive select { width: auto; }
 .ws-title h2 { font-size: 20px; font-weight: 650; }
 .ws-title kbd { font-family: var(--mono); font-size: 11px; background: var(--bg-2); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; }
 .ws { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 14px; align-items: stretch; height: calc(100vh - 150px); min-height: 520px; }

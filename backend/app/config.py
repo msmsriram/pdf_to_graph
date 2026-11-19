@@ -21,7 +21,7 @@ class Settings(BaseSettings):
 
     # OpenAI
     openai_api_key: str = ""
-    openai_model: str = "gpt-6-astra"
+    openai_model: str = "gpt-6.2-sol"
     reasoning_effort: str = "high"
     image_detail: str = "original"
     openai_timeout_seconds: float = Field(default=900, gt=0)

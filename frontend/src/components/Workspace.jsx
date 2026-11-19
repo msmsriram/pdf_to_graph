@@ -73,6 +73,7 @@ export default function Workspace() {
   const selectChart = useStore((s) => s.selectChart);
   const leftRailOpen = useStore((s) => s.leftRailOpen);
   const toggleRail = useStore((s) => s.toggleRail);
+  const theme = useStore((s) => s.theme);
 
   // Keyboard: [ toggles the chart list, ] toggles the editor (ignored while typing).
   useEffect(() => {
@@ -115,6 +116,7 @@ export default function Workspace() {
           {charts.length} charts across {document?.page_count} pages
           {skippedCount > 0 ? ` · ${skippedCount} skipped by the gate` : ""} · <kbd>[</kbd> / <kbd>]</kbd> toggle the side rails
         </div>
+        <ChartArchiveDownload key={docId} charts={charts} documentName={document?.name} theme={theme} />
       </div>
 
       <div className="ws">
@@ -160,5 +162,52 @@ export default function Workspace() {
         {selected && <ChartEditor key={selected.chart_id} docId={docId} chart={selected} />}
       </div>
     </div>
+  );
+}
+
+function ChartArchiveDownload({ charts, documentName, theme }) {
+  const [choosing, setChoosing] = useState(false);
+  const [format, setFormat] = useState("png");
+  const [progress, setProgress] = useState(null);
+  const [error, setError] = useState("");
+  const busy = progress !== null;
+
+  const download = async (event) => {
+    event.preventDefault();
+    if (busy) return;
+    setProgress({ current: 0, total: charts.length });
+    setError("");
+    try {
+      const { downloadChartArchive } = await import("../lib/chartArchive.js");
+      await downloadChartArchive(charts, format, theme, documentName, (current) => {
+        setProgress({ current, total: charts.length });
+      });
+      setChoosing(false);
+    } catch (e) {
+      setError(e?.message || "Could not create the chart ZIP. Try again.");
+    } finally {
+      setProgress(null);
+    }
+  };
+
+  if (!choosing) {
+    return <button className="btn btn-sm ws-archive" onClick={() => setChoosing(true)}>Download all charts</button>;
+  }
+
+  return (
+    <form className="ws-archive inline" onSubmit={download}>
+      <label className="inline">
+        Image format
+        <select className="input" value={format} disabled={busy} onChange={(e) => setFormat(e.target.value)}>
+          <option value="png">PNG</option>
+          <option value="svg">SVG</option>
+          <option value="jpeg">JPEG</option>
+        </select>
+      </label>
+      <button className="btn btn-sm" disabled={busy}>Download ZIP</button>
+      <button className="btn btn-sm" type="button" disabled={busy} onClick={() => { setChoosing(false); setError(""); }}>Cancel</button>
+      {busy && <span className="muted" role="status">Preparing {progress.current} of {progress.total} charts…</span>}
+      {error && <span className="warn-banner" role="alert">{error}</span>}
+    </form>
   );
 }
