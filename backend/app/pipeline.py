@@ -198,7 +198,7 @@ async def _screen_page(document_id, pm):
         await _log(document_id, f"{label}: no charts (gate {probability:.0%}) — skipped. {verdict.reason}")
         await _emit(document_id, {"type": "page_skipped", "page_number": page_no, "reason": verdict.reason})
     else:
-        await _log(document_id, f"{label}: gate sees {verdict.chart_count} chart(s) ({probability:.0%}) → extracting with {s.openai_model}")
+        await _log(document_id, f"{label}: gate sees {verdict.chart_count} chart(s) ({probability:.0%}) → extracting")
     return skipped
 
 
@@ -306,9 +306,10 @@ async def analyze_page(document_id: str, page_no: int, running_notes: str = "") 
         if page["status"] == "analyzed":
             return page.get("context_notes", "")
         path = await asyncio.to_thread(storage.asset_path, document_id, page["image"])
-        await _log(document_id, f"Sending {_label(page)} to {s.openai_model} ({s.reasoning_effort} reasoning)…")
+        model = m.get("extraction_model") or s.openai_model
+        await _log(document_id, f"Sending {_label(page)} to {model}…")
         started = time.perf_counter()
-        extraction, usage = await _model_call("extract", extract_page, path, page_no, running_notes)
+        extraction, usage = await _model_call("extract", extract_page, path, page_no, running_notes, model)
         usage.setdefault("seconds", round(time.perf_counter() - started, 2))
 
         async with _commit_lock(document_id):
@@ -318,7 +319,7 @@ async def analyze_page(document_id: str, page_no: int, running_notes: str = "") 
                         context_notes=(extraction.updated_running_notes or "")[:2000])
             page.pop("error", None)
             m["progress"]["pages_analyzed"] += 1
-            block = costs.ensure_usage_block(m, s.openai_model)
+            block = costs.ensure_usage_block(m, model)
             usage["cost_usd"] = costs.cost_usd(usage, block["pricing"])
             page["usage"] = usage
             costs.add_to_totals(block["totals"], usage)

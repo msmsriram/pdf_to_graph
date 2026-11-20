@@ -20,6 +20,9 @@ from typing import Any
 PRICING: dict[str, dict[str, float]] = {
     # Official Standard rates verified 2026-10-28; USD / 1M tokens.
     "gpt-6.1-sol": {"input": 2.0, "cached_input": 0.1, "output": 10.0},
+    "gpt-6.2-sol": {"input": 2.0, "cached_input": 0.1, "output": 10.0},
+    "gpt-5.5-pro": {"input": 30.0, "cached_input": 30.0, "output": 180.0},
+    "gpt-5.5-pro-2026-04-23": {"input": 30.0, "cached_input": 30.0, "output": 180.0},
     "gpt-6-astra": {"input": 10.0, "cached_input": 1.0, "output": 50.0},
     "gpt-5.6-sol": {"input": 5.0, "cached_input": 0.5, "output": 30.0},
     # gate model (OpenAI list price, standard tier)

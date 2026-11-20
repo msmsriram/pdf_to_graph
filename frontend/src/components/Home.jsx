@@ -24,6 +24,8 @@ export default function Home() {
   const [docs, setDocs] = useState([]);
   const [items, setItems] = useState([]); // {id, kind:'pdf'|'image', file, label, url}
   const [name, setName] = useState("");
+  const [modelTier, setModelTier] = useState("high");
+  const [modelIds, setModelIds] = useState(null);
   const [nameTouched, setNameTouched] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadPct, setUploadPct] = useState(0);
@@ -38,6 +40,7 @@ export default function Home() {
   }, []);
   useEffect(() => {
     refresh();
+    api.health().then((health) => setModelIds(health.extraction_models)).catch(() => {});
   }, [refresh]);
 
   const pdf = items.find((i) => i.kind === "pdf");
@@ -115,7 +118,7 @@ export default function Home() {
     setUploading(true);
     setUploadPct(0);
     try {
-      const res = await api.uploadBundle({ pdf: pdf?.file, images: images.map((i) => ({ file: i.file, label: i.label.trim() })), name: name.trim() }, setUploadPct);
+      const res = await api.uploadBundle({ pdf: pdf?.file, images: images.map((i) => ({ file: i.file, label: i.label.trim() })), name: name.trim(), modelTier }, setUploadPct);
       clear();
       startProcessing(res.document_id, res.name);
     } catch (e) {
@@ -222,6 +225,15 @@ export default function Home() {
               </div>
             ))}
           </div>
+          <label className="inline" style={{ marginTop: 14 }}>
+            Extraction model
+            <select className="input" style={{ width: "auto", maxWidth: "100%" }} value={modelTier}
+              onChange={(e) => setModelTier(e.target.value)} disabled={uploading}>
+              <option value="low">Low · {modelIds?.low || "gpt-5.5-pro"}</option>
+              <option value="medium">Medium · {modelIds?.medium || "gpt-6-astra"}</option>
+              <option value="high">High · {modelIds?.high || "gpt-6.2-sol"}</option>
+            </select>
+          </label>
           {uploading && (
             <div className="progress-track" style={{ marginTop: 12 }}>
               <div className="progress-fill" style={{ width: `${uploadPct}%` }} />

@@ -12,11 +12,12 @@ export const api = {
   reprocessDocument: (id) => http.post(`/documents/${id}/reprocess`).then((r) => r.data),
   // One upload = one document: an optional PDF plus any number of named images.
   // `images`: [{ file, label }]. The backend turns images into pages after the PDF's.
-  uploadBundle: ({ pdf, images = [], name = "" }, onProgress) => {
+  uploadBundle: ({ pdf, images = [], name = "", modelTier = "high" }, onProgress) => {
     const form = new FormData();
     if (pdf) form.append("files", pdf, pdf.name);
     images.forEach((im, i) => form.append("files", im.file, im.file.name || `image-${i + 1}.png`));
     form.append("name", name);
+    form.append("model_tier", modelTier);
     form.append("image_labels", JSON.stringify(images.map((im) => im.label || "")));
     return http
       .post("/documents", form, {

@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: str = ""
     openai_model: str = "gpt-6.2-sol"
+    openai_model_low: str = "gpt-5.5-pro"
+    openai_model_medium: str = "gpt-6-astra"
     reasoning_effort: str = "high"
     image_detail: str = "original"
     openai_timeout_seconds: float = Field(default=900, gt=0)
@@ -57,6 +59,10 @@ class Settings(BaseSettings):
     # Covers Vercel deploy URLs (which change per deploy) and Render static sites.
     # Override with the CORS_ORIGIN_REGEX env var; set it empty to disable.
     cors_origin_regex: str = r"^https://(pdf-to-graph[a-z0-9-]*\.vercel\.app|[a-z0-9-]+\.onrender\.com)$"
+
+    @property
+    def extraction_models(self) -> dict[str, str]:
+        return {"low": self.openai_model_low, "medium": self.openai_model_medium, "high": self.openai_model}
 
     @property
     def storage_path(self) -> Path:

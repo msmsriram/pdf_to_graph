@@ -125,7 +125,8 @@ def mark_interrupted() -> None:
 
 
 def create_manifest(
-    document_id: str, name: str, original_filename: str, sources: Optional[list[dict[str, Any]]] = None
+    document_id: str, name: str, original_filename: str, sources: Optional[list[dict[str, Any]]] = None,
+    *, extraction_model: str | None = None,
 ) -> dict[str, Any]:
     """`sources`: what was uploaded — [{kind: "pdf", filename}, {kind: "image", filename, label}, …].
     A document is one PDF (optional) plus any number of named images; images become
@@ -153,6 +154,8 @@ def create_manifest(
         },
         "error": None,
     }
+    if extraction_model:
+        manifest["extraction_model"] = extraction_model
     write_manifest(manifest)
     return manifest
 

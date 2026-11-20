@@ -8,11 +8,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from fastapi.testclient import TestClient
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app import pipeline, storage, costs
+from app import main, pipeline, storage, costs
 from app.config import get_settings
 from app.events import EventBus
 from app.schemas import ExtractedChart, GateResult, PageExtraction
@@ -72,12 +73,12 @@ class ParallelPipelineTests(unittest.TestCase):
         self.leave('gate', n)
         return GateResult(has_charts=True, chart_count=1, confidence=0.99, reason='Test chart'), self.usage(self.settings.gate_model)
 
-    def extract(self, path, number, context):
+    def extract(self, path, number, context, model):
         self.enter('extract', number)
         time.sleep(0.04 if number == 4 else (0.5 if number == 1 else 0.3))
         self.leave('extract', number)
         chart = ExtractedChart(title=f'Chart {number}', bbox=[0, 0, 1, 1])
-        return PageExtraction(page_number=number, summary='test', has_charts=True, charts=[chart], updated_running_notes=''), self.usage(self.settings.openai_model)
+        return PageExtraction(page_number=number, summary='test', has_charts=True, charts=[chart], updated_running_notes=''), self.usage(model)
 
     @staticmethod
     def usage(model):
@@ -85,6 +86,9 @@ class ParallelPipelineTests(unittest.TestCase):
                 'cached_tokens': 0, 'reasoning_tokens': 0, 'total_tokens': 30}
 
     def test_parallel_stages_batch_boundaries_and_ordered_persistence(self):
+        manifest = storage.read_manifest('parallel')
+        manifest['extraction_model'] = self.settings.openai_model_medium
+        storage.write_manifest(manifest)
         with patch.object(pipeline.gate, 'classify_page', side_effect=self.gate), patch.object(pipeline, 'extract_page', side_effect=self.extract):
             asyncio.run(pipeline.process_document('parallel'))
         m = storage.read_manifest('parallel')
@@ -92,6 +96,8 @@ class ParallelPipelineTests(unittest.TestCase):
         self.assertEqual([c['page_number'] for c in m['charts']], list(range(1, 8)))
         self.assertEqual(m['progress']['pages_analyzed'], 7)
         self.assertEqual(m['usage']['totals']['calls'], 7)
+        self.assertEqual(m['usage']['model'], self.settings.openai_model_medium)
+        self.assertTrue(all(p['usage']['model'] == self.settings.openai_model_medium for p in m['pages']))
         self.assertEqual(m['usage']['gate']['totals']['calls'], 7)
         self.assertLessEqual(self.peak, 5)
         self.assertGreater(self.gate_peak, 1)
@@ -102,10 +108,10 @@ class ParallelPipelineTests(unittest.TestCase):
         self.assertNotEqual(arrived, sorted(arrived))
 
     def test_one_failed_page_keeps_successful_siblings(self):
-        def extract(path, number, context):
+        def extract(path, number, context, model):
             if number == 2:
                 raise RuntimeError('intentional page failure')
-            return self.extract(path, number, context)
+            return self.extract(path, number, context, model)
         with patch.object(pipeline.gate, 'classify_page', side_effect=self.gate), patch.object(pipeline, 'extract_page', side_effect=extract):
             asyncio.run(pipeline.process_document('parallel'))
         m = storage.read_manifest('parallel')
@@ -113,6 +119,24 @@ class ParallelPipelineTests(unittest.TestCase):
         self.assertEqual(len(m['charts']), 6)
         self.assertEqual(m['progress']['pages_analyzed'], 7)
         self.assertEqual(m['pages'][1]['status'], 'error')
+
+    def test_upload_resolves_tiers_and_reprocess_keeps_original_model(self):
+        client = TestClient(main.app)
+        image = storage.doc_dir('parallel') / 'sources' / 'image1.png'
+        files = {'files': ('chart.png', image.read_bytes(), 'image/png')}
+        with patch.object(pipeline, 'start') as start:
+            for tier, model in self.settings.extraction_models.items():
+                response = client.post('/api/documents', files=files, data={'model_tier': tier})
+                self.assertEqual(response.status_code, 200, response.text)
+                document_id = response.json()['document_id']
+                saved = storage.read_manifest(document_id)
+                self.assertEqual(saved['extraction_model'], model)
+                storage.set_status(document_id, 'complete', 'Ready')
+                replay = main.prepare_reprocess(document_id)
+                self.assertEqual(storage.read_manifest(replay['document_id'])['extraction_model'], model)
+            invalid = client.post('/api/documents', files=files, data={'model_tier': 'arbitrary-model'})
+            self.assertEqual(invalid.status_code, 422)
+            self.assertEqual(start.call_count, 3)
 
     def test_cancelled_model_threads_keep_slots_until_they_finish(self):
         release = threading.Event()

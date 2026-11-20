@@ -14,6 +14,7 @@ import uuid
 import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -71,6 +72,7 @@ async def health() -> dict:
     return {
         "ok": True,
         "model": settings.openai_model,
+        "extraction_models": settings.extraction_models,
         "gate_model": settings.gate_model if settings.gate_enabled else None,
         "has_key": bool(settings.openai_api_key),
         "storage_backend": settings.storage_backend,
@@ -88,6 +90,7 @@ async def upload_document(
     files: list[UploadFile] = File(...),
     name: str = Form(""),
     image_labels: str = Form("[]"),
+    model_tier: Literal["low", "medium", "high"] = Form("high"),
 ) -> dict:
     """One upload = one document: at most one PDF plus any number of PNG/JPEG images.
     `image_labels` is a JSON list of user-given names, in the order the images appear."""
@@ -124,7 +127,9 @@ async def upload_document(
 
     doc_name = name.strip() or (Path(pdfs[0].filename).stem if pdfs else sources[0]["label"])
     original_filename = pdfs[0].filename if pdfs else (images[0].filename or "images")
-    await asyncio.to_thread(storage.create_manifest, document_id, name=doc_name, original_filename=original_filename, sources=sources)
+    extraction_model = settings.extraction_models[model_tier]
+    await asyncio.to_thread(storage.create_manifest, document_id, name=doc_name, original_filename=original_filename,
+                            sources=sources, extraction_model=extraction_model)
 
     # Kick off background processing (fire and forget; progress via WebSocket).
     pipeline.start(document_id)
@@ -149,7 +154,8 @@ def prepare_reprocess(document_id: str) -> dict:
         destination = storage.doc_dir(new_id) / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, destination)
-    new = storage.create_manifest(new_id, m["name"] + " · reprocessed", m["original_filename"], m.get("sources"))
+    new = storage.create_manifest(new_id, m["name"] + " · reprocessed", m["original_filename"], m.get("sources"),
+                                  extraction_model=m.get("extraction_model") or settings.openai_model)
     new["reprocessed_from"] = document_id
     storage.write_manifest(new)
     return {"document_id": new_id, "name": new["name"], "status": "uploaded"}
@@ -315,8 +321,9 @@ async def rerun_chart(document_id: str, chart_id: str, body: RerunRequest) -> di
 
     prior = chart["versions"][chart["current_version"]]["spec"]
     t0 = time.perf_counter()
+    document_model = m.get("extraction_model") or settings.openai_model
     try:
-        ec, usage = await pipeline._model_call("extract", extract_single_chart, crop, prior, body.effort, body.model)
+        ec, usage = await pipeline._model_call("extract", extract_single_chart, crop, prior, body.effort, body.model or document_model)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Re-extraction failed: {exc}")
     usage.setdefault("seconds", round(time.perf_counter() - t0, 2))
@@ -335,7 +342,7 @@ async def rerun_chart(document_id: str, chart_id: str, body: RerunRequest) -> di
 
     # Document-level accounting: list the re-run and add it to the totals.
     m2 = await asyncio.to_thread(storage.read_manifest, document_id)
-    ublock = costs.ensure_usage_block(m2, settings.openai_model)
+    ublock = costs.ensure_usage_block(m2, document_model)
     ublock["reruns"].append({"chart_id": chart_id, "version": chart_out["current_version"], "at": storage._now(), **usage})
     costs.add_to_totals(ublock["totals"], usage)
     await asyncio.to_thread(storage.write_manifest, m2)

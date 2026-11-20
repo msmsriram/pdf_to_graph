@@ -155,10 +155,20 @@ Be accurate and conservative. If you are unsure whether something is a chart, lo
 rather than inventing data."""
 
 
-def extract_page(page_png: Path, page_number: int, running_notes: str) -> tuple[PageExtraction, dict]:
+def _extraction_options(model: str, effort: str, detail: str) -> tuple[str, str]:
+    if model == "gpt-5.5-pro" or model.startswith("gpt-5.5-pro-"):
+        effort = {"none": "medium", "low": "medium", "max": "xhigh"}.get(effort, effort)
+        if detail == "original":
+            detail = "high"
+    return effort, detail
+
+
+def extract_page(page_png: Path, page_number: int, running_notes: str, model: str | None = None) -> tuple[PageExtraction, dict]:
     """Returns (extraction, usage) — usage holds the API's billed token counts."""
     settings = get_settings()
     client = _get_client()
+    model = model or settings.openai_model
+    effort, detail = _extraction_options(model, settings.reasoning_effort, settings.image_detail)
 
     user_text = (
         f"Page number: {page_number}.\n"
@@ -170,7 +180,7 @@ def extract_page(page_png: Path, page_number: int, running_notes: str) -> tuple[
         {
             "type": "input_image",
             "image_url": _encode_image(page_png),
-            "detail": settings.image_detail,
+            "detail": detail,
         },
     ]
     messages = [{"role": "user", "content": content}]
@@ -178,8 +188,8 @@ def extract_page(page_png: Path, page_number: int, running_notes: str) -> tuple[
     # Primary path: strict structured output. System prompt via `instructions`.
     try:
         resp, limits = _parse_with_headers(client,
-            model=settings.openai_model,
-            reasoning={"effort": settings.reasoning_effort},
+            model=model,
+            reasoning={"effort": effort},
             instructions=SYSTEM_PROMPT,
             input=messages,
             text_format=PageExtraction,
@@ -187,22 +197,22 @@ def extract_page(page_png: Path, page_number: int, running_notes: str) -> tuple[
         parsed = resp.output_parsed
         if parsed is not None:
             parsed.page_number = page_number
-            return parsed, {**_usage_from(resp, settings.openai_model, settings.reasoning_effort), "rate_limits": limits}
+            return parsed, {**_usage_from(resp, model, effort), "rate_limits": limits}
         raise RuntimeError("Model returned no structured extraction")
     except (AttributeError, NotImplementedError) as exc:
         print(f"[openai] responses.parse failed on page {page_number}: {exc!r}; trying JSON fallback")
 
     # Fallback path: ask for raw JSON and validate ourselves.
     resp = client.responses.create(
-        model=settings.openai_model,
-        reasoning={"effort": settings.reasoning_effort},
+        model=model,
+        reasoning={"effort": effort},
         instructions=SYSTEM_PROMPT + "\n\nReturn ONLY valid JSON matching the schema.",
         input=messages,
     )
     raw = resp.output_text or "{}"
     data = _loads_lenient(raw)
     data["page_number"] = page_number
-    return PageExtraction.model_validate(data), _usage_from(resp, settings.openai_model, settings.reasoning_effort)
+    return PageExtraction.model_validate(data), _usage_from(resp, model, effort)
 
 
 SINGLE_CHART_ADDENDUM = """
@@ -223,7 +233,7 @@ def extract_single_chart(
     settings = get_settings()
     client = _get_client()
     use_model = model or settings.openai_model
-    use_effort = effort or settings.reasoning_effort
+    use_effort, detail = _extraction_options(use_model, effort or settings.reasoning_effort, settings.image_detail)
     user_text = (
         "Re-extract this single chart.\n"
         f"Previous extraction (reference only, may be wrong):\n{json.dumps(prior_spec, ensure_ascii=False)[:6000]}"
@@ -233,7 +243,7 @@ def extract_single_chart(
             "role": "user",
             "content": [
                 {"type": "input_text", "text": user_text},
-                {"type": "input_image", "image_url": _encode_image(crop_png), "detail": settings.image_detail},
+                {"type": "input_image", "image_url": _encode_image(crop_png), "detail": detail},
             ],
         }
     ]
