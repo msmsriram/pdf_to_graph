@@ -22,7 +22,6 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: str = ""
     openai_model: str = "gpt-6.2-sol"
-    openai_model_low: str = "gpt-5.5-pro"
     openai_model_medium: str = "gpt-6-astra"
     reasoning_effort: str = "high"
     image_detail: str = "original"
@@ -62,7 +61,7 @@ class Settings(BaseSettings):
 
     @property
     def extraction_models(self) -> dict[str, str]:
-        return {"low": self.openai_model_low, "medium": self.openai_model_medium, "high": self.openai_model}
+        return {"medium": self.openai_model_medium, "high": self.openai_model}
 
     @property
     def storage_path(self) -> Path:

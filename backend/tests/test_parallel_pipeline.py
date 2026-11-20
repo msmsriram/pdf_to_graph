@@ -134,8 +134,13 @@ class ParallelPipelineTests(unittest.TestCase):
                 storage.set_status(document_id, 'complete', 'Ready')
                 replay = main.prepare_reprocess(document_id)
                 self.assertEqual(storage.read_manifest(replay['document_id'])['extraction_model'], model)
-            invalid = client.post('/api/documents', files=files, data={'model_tier': 'arbitrary-model'})
-            self.assertEqual(invalid.status_code, 422)
+            default = client.post('/api/documents', files=files)
+            self.assertEqual(default.status_code, 200, default.text)
+            self.assertEqual(storage.read_manifest(default.json()['document_id'])['extraction_model'],
+                             self.settings.openai_model_medium)
+            for tier in ('low', 'arbitrary-model'):
+                invalid = client.post('/api/documents', files=files, data={'model_tier': tier})
+                self.assertEqual(invalid.status_code, 422)
             self.assertEqual(start.call_count, 3)
 
     def test_cancelled_model_threads_keep_slots_until_they_finish(self):

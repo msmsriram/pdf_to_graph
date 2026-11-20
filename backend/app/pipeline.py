@@ -307,7 +307,7 @@ async def analyze_page(document_id: str, page_no: int, running_notes: str = "") 
             return page.get("context_notes", "")
         path = await asyncio.to_thread(storage.asset_path, document_id, page["image"])
         model = m.get("extraction_model") or s.openai_model
-        await _log(document_id, f"Sending {_label(page)} to {model}…")
+        await _log(document_id, f"Extracting charts from {_label(page)}…")
         started = time.perf_counter()
         extraction, usage = await _model_call("extract", extract_page, path, page_no, running_notes, model)
         usage.setdefault("seconds", round(time.perf_counter() - started, 2))

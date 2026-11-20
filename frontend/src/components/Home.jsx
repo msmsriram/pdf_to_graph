@@ -24,8 +24,7 @@ export default function Home() {
   const [docs, setDocs] = useState([]);
   const [items, setItems] = useState([]); // {id, kind:'pdf'|'image', file, label, url}
   const [name, setName] = useState("");
-  const [modelTier, setModelTier] = useState("high");
-  const [modelIds, setModelIds] = useState(null);
+  const [modelTier, setModelTier] = useState("medium");
   const [nameTouched, setNameTouched] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadPct, setUploadPct] = useState(0);
@@ -40,7 +39,6 @@ export default function Home() {
   }, []);
   useEffect(() => {
     refresh();
-    api.health().then((health) => setModelIds(health.extraction_models)).catch(() => {});
   }, [refresh]);
 
   const pdf = items.find((i) => i.kind === "pdf");
@@ -229,9 +227,8 @@ export default function Home() {
             Extraction model
             <select className="input" style={{ width: "auto", maxWidth: "100%" }} value={modelTier}
               onChange={(e) => setModelTier(e.target.value)} disabled={uploading}>
-              <option value="low">Low · {modelIds?.low || "gpt-5.5-pro"}</option>
-              <option value="medium">Medium · {modelIds?.medium || "gpt-6-astra"}</option>
-              <option value="high">High · {modelIds?.high || "gpt-6.2-sol"}</option>
+              <option value="medium">Normal</option>
+              <option value="high">Advanced</option>
             </select>
           </label>
           {uploading && (

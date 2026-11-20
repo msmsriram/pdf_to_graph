@@ -72,7 +72,6 @@ async def health() -> dict:
     return {
         "ok": True,
         "model": settings.openai_model,
-        "extraction_models": settings.extraction_models,
         "gate_model": settings.gate_model if settings.gate_enabled else None,
         "has_key": bool(settings.openai_api_key),
         "storage_backend": settings.storage_backend,
@@ -90,7 +89,7 @@ async def upload_document(
     files: list[UploadFile] = File(...),
     name: str = Form(""),
     image_labels: str = Form("[]"),
-    model_tier: Literal["low", "medium", "high"] = Form("high"),
+    model_tier: Literal["medium", "high"] = Form("medium"),
 ) -> dict:
     """One upload = one document: at most one PDF plus any number of PNG/JPEG images.
     `image_labels` is a JSON list of user-given names, in the order the images appear."""
